@@ -1,0 +1,36 @@
+# Small, fast render profiles for the test-suite only.
+profiles:
+  vertical_test:
+    aspect_ratio: "9:16"
+    width: 360
+    height: 640
+    fps: 15
+    video_codec: h264
+    audio_codec: aac
+    crf: 30
+    preset: ultrafast
+    audio_bitrate_kbps: 64
+    version: "1"
+    default: true
+  horizontal_test:
+    aspect_ratio: "16:9"
+    width: 640
+    height: 360
+    fps: 15
+    video_codec: h264
+    audio_codec: aac
+    crf: 30
+    preset: ultrafast
+    audio_bitrate_kbps: 64
+    version: "1"
+  square_test:
+    aspect_ratio: "1:1"
+    width: 480
+    height: 480
+    fps: 15
+    video_codec: h264
+    audio_codec: aac
+    crf: 30
+    preset: ultrafast
+    audio_bitrate_kbps: 64
+    version: "1"
