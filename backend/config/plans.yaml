@@ -1,0 +1,44 @@
+# Quota / entitlement plans (TRD §34, §55). All limits are configuration.
+# `null` means unlimited. Minutes are minutes of *source* video.
+plans:
+  free:
+    daily_source_minutes: 60
+    monthly_source_minutes: null
+    concurrent_jobs: 1
+    max_duration_minutes: 60
+    max_clips_per_job: 10
+    priority: 0
+    batch_enabled: false
+  pro:
+    daily_source_minutes: null
+    monthly_source_minutes: 1000
+    concurrent_jobs: 3
+    max_duration_minutes: 180
+    max_clips_per_job: 20
+    priority: 1
+    batch_enabled: false
+  creator:
+    daily_source_minutes: null
+    monthly_source_minutes: 3000
+    concurrent_jobs: 5
+    max_duration_minutes: 180
+    max_clips_per_job: 20
+    priority: 2
+    batch_enabled: true
+  team:
+    daily_source_minutes: null
+    monthly_source_minutes: 10000
+    concurrent_jobs: 10
+    max_duration_minutes: 180
+    max_clips_per_job: 20
+    priority: 2
+    batch_enabled: true
+  # Local/private deployments default to this plan (effectively unlimited).
+  unlimited:
+    daily_source_minutes: null
+    monthly_source_minutes: null
+    concurrent_jobs: 100
+    max_duration_minutes: null
+    max_clips_per_job: 20
+    priority: 1
+    batch_enabled: true
