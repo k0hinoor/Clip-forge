@@ -40,7 +40,7 @@ from .ffmpeg import (
     probe_media,
     video_encoder_args,
 )
-from .framing import CropPlan
+from .framing import CropPlan, fit_crop_to_panel
 from .runner import run_command
 from .timeline import Timeline
 
@@ -208,17 +208,22 @@ def podcast_layer(
     fps: int = 30,
     zoomable: bool = True,
 ) -> str:
-    """Filter chain for the podcast panel: crop → punch-in → scale."""
+    """Filter chain for the podcast panel: crop → cover-scale → punch-in.
+
+    The scale always preserves the aspect ratio (cover, then trim the rounding
+    overflow), so a crop window that does not exactly match the panel can never
+    stretch the speaker.
+    """
     parts: list[str] = []
-    if plan is not None and plan.crop_width < plan.source_width:
+    if plan is not None and (plan.crop_width < plan.source_width or plan.crop_height < plan.source_height):
         parts.append(
             f"crop=w={plan.crop_width}:h={plan.crop_height}"
             f":x='{plan.crop_x_expression()}':y='{plan.crop_y_expression()}'"
         )
+    parts.append(f"scale={panel_width}:{panel_height}:force_original_aspect_ratio=increase:flags=lanczos")
+    parts.append(f"crop={panel_width}:{panel_height}")
     if zoomable and zoom:
         parts.append(zoom_filter(zoom, panel_width=panel_width, panel_height=panel_height, fps=fps))
-    else:
-        parts.append(f"scale={panel_width}:{panel_height}:flags=lanczos")
     parts.append("setsar=1")
     return ",".join(parts)
 
@@ -353,21 +358,22 @@ def build_filter_graph(
     video_label = "[vstd]"
 
     zoom = zoom_expression(spec.zoom_points, duration=duration)
-    # zoompan renumbers timestamps at `fps`, so run it at the *source* frame rate -
-    # otherwise a 25 fps source would be squeezed to fit a 30 fps clock and the
-    # video would drift away from its own audio.
-    zoom_fps = int(round(spec.source_fps or spec.fps))
-    if zoom and not spec.source_fps:
-        spec.notes.append("Punch-ins were skipped: the source frame rate could not be measured.")
-        zoom = ""
+    # zoompan stamps one output frame per input frame on its own `fps` clock, so
+    # it must run at the cadence of its input - the stream normalised to
+    # ``spec.fps`` just above. Any other rate would drift away from the audio.
+    zoom_fps = int(spec.fps)
     ratio = max(30, min(int(spec.split_ratio), 80))
 
     if layout in SPLIT_LAYOUTS:
         podcast_height = int(round(height * ratio / 100.0 / 2) * 2)
-        asset_height = int(round(height * (100 - ratio) / 100.0 / 2) * 2)
+        asset_height = height - podcast_height
     else:
         podcast_height = height
         asset_height = 0
+    # Stored crop plans may be cut for another panel (full frame vs split, or an
+    # older aspect ratio); re-cut the window for the panel actually drawn here.
+    asset_layout = layout in SPLIT_LAYOUTS and (spec.broll_path if layout == "broll" else spec.gameplay_path) is not None
+    crop_plan = fit_crop_to_panel(spec.crop_plan, width, podcast_height if asset_layout else height)
 
     if layout == "blur":
         # Two chains read the same frames, so the pad has to be split explicitly:
@@ -385,7 +391,7 @@ def build_filter_graph(
         video_out = "[vframed]"
     elif layout == "cinematic":
         graph.append(
-            f"{video_label}{background_layer(spec.crop_plan, width=width, height=height, zoom=zoom, fps=zoom_fps)}[vframed]"
+            f"{video_label}{background_layer(crop_plan, width=width, height=height, zoom=zoom, fps=zoom_fps)}[vframed]"
         )
         video_out = "[vframed]"
     else:
@@ -395,7 +401,7 @@ def build_filter_graph(
             if asset_path is not None:
                 spec.notes.append(f"Layout '{layout}' renders the speaker full-frame; the selected asset was not used.")
             graph.append(
-                f"{video_label}{podcast_layer(spec.crop_plan, panel_width=width, panel_height=height, zoom=zoom, fps=zoom_fps)}[vframed]"
+                f"{video_label}{podcast_layer(crop_plan, panel_width=width, panel_height=height, zoom=zoom, fps=zoom_fps)}[vframed]"
             )
             video_out = "[vframed]"
         elif asset_path is None:
@@ -404,14 +410,14 @@ def build_filter_graph(
                 "so the clip was rendered as a full-frame speaker cut."
             )
             graph.append(
-                f"{video_label}{podcast_layer(spec.crop_plan, panel_width=width, panel_height=height, zoom=zoom, fps=zoom_fps)}[vframed]"
+                f"{video_label}{podcast_layer(crop_plan, panel_width=width, panel_height=height, zoom=zoom, fps=zoom_fps)}[vframed]"
             )
             video_out = "[vframed]"
         elif layout == "gameplay":
             asset_index = inputs.add(asset_path, extra=["-stream_loop", "-1"])
             asset_info = _safe_probe(asset_path)
             graph.append(
-                f"{video_label}{podcast_layer(spec.crop_plan, panel_width=width, panel_height=podcast_height, zoom=zoom, fps=zoom_fps)}[pod]"
+                f"{video_label}{podcast_layer(crop_plan, panel_width=width, panel_height=podcast_height, zoom=zoom, fps=zoom_fps)}[pod]"
             )
             graph.append(
                 asset_layer(
@@ -427,7 +433,7 @@ def build_filter_graph(
             asset_index = inputs.add(asset_path, extra=["-stream_loop", "-1"])
             asset_info = _safe_probe(asset_path)
             graph.append(
-                f"{video_label}{podcast_layer(spec.crop_plan, panel_width=width, panel_height=podcast_height, zoom=zoom, fps=zoom_fps)}[pod]"
+                f"{video_label}{podcast_layer(crop_plan, panel_width=width, panel_height=podcast_height, zoom=zoom, fps=zoom_fps)}[pod]"
             )
             graph.append(
                 asset_layer(
@@ -466,7 +472,13 @@ def build_filter_graph(
     voice_chain = audio_filter_chain(settings, measured=audio_measured, source="voice")
     if abs(speed - 1.0) > 0.001:
         voice_chain = f"atempo={speed:.4f}," + voice_chain
-    graph.append(f"{audio_label}{voice_chain}[voice]")
+    duck_music = spec.music_path is not None and settings.music_enabled and settings.ducking
+    if duck_music:
+        # The voice feeds both the mix and the ducking side-chain; a filter pad
+        # can only be consumed once, so it is split explicitly.
+        graph.append(f"{audio_label}{voice_chain},asplit=2[voice][voicekey]")
+    else:
+        graph.append(f"{audio_label}{voice_chain}[voice]")
 
     mix_labels = ["[voice]"]
     if asset_path := (spec.gameplay_path if layout in {"split", "gameplay"} else spec.broll_path if layout == "broll" else None):
@@ -484,8 +496,8 @@ def build_filter_graph(
             f"[{music_index}:a]atrim=duration={duration + 0.75:.3f},asetpts=PTS-STARTPTS,"
             f"volume={settings.music_volume:.3f}[mus]"
         )
-        if settings.ducking:
-            graph.append("[mus][voice]sidechaincompress=threshold=0.035:ratio=9:attack=12:release=320[musicducked]")
+        if duck_music:
+            graph.append(f"[mus][voicekey]sidechaincompress=threshold=0.035:ratio={ducking_ratio(settings.ducking_db):.1f}:attack=12:release=320[musicducked]")
             mix_labels.append("[musicducked]")
         else:
             mix_labels.append("[mus]")
@@ -506,6 +518,16 @@ def build_filter_graph(
     graph.append(f"{final_audio}{','.join(tail)}[aout]")
 
     return ";".join(graph), "vout", "aout", inputs.args
+
+
+def ducking_ratio(ducking_db: float) -> float:
+    """Side-chain compression ratio for the requested music dip (dB, negative).
+
+    Speech normalised to the loudness target sits roughly 10-12 dB above the
+    compressor threshold, so ``1 + |dB| / 1.5`` lands the music close to the
+    requested reduction while someone is talking (-12 dB -> ratio 9).
+    """
+    return max(2.0, min(20.0, 1.0 + abs(float(ducking_db)) / 1.5))
 
 
 def _safe_probe(path: Path | None) -> MediaInfo:
@@ -644,6 +666,7 @@ __all__ = [
     "build_ffmpeg_command",
     "build_filter_graph",
     "command_preview",
+    "ducking_ratio",
     "estimate_render_seconds",
     "graph_summary",
     "podcast_layer",

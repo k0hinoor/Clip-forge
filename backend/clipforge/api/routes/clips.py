@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
 
 from ...errors import ClipForgeError, ErrorCode
+from ...jobs import queue as job_queue
 from ...jobs.manager import manager
 from ...logging_setup import get_logger
 from ...services import clips as clip_service
@@ -14,7 +19,22 @@ from ..media import require_file, stream_file
 from ..schemas import CaptionPreviewRequest, ClipUpdate, RenderRequest
 
 router = APIRouter(prefix="/clips", tags=["clips"])
+captions_router = APIRouter(tags=["clips"])
 log = get_logger(__name__)
+
+
+class ClipRenderRequest(BaseModel):
+    export: bool = Field(False, description="Also copy the finished file into the export folder")
+    overrides: dict[str, Any] = Field(default_factory=dict, description="One-off settings for this render only")
+
+
+class ClipPreviewRequest(BaseModel):
+    priority: int = Field(2, ge=0, le=10)
+
+
+class RegenerateRequest(BaseModel):
+    window: float = Field(120.0, ge=20, le=900, description="Seconds of transcript around the clip to search")
+    use_llm: bool = True
 
 
 @router.post("/render-all")
@@ -27,13 +47,16 @@ def render_all(payload: RenderRequest):
             hint="Pass clip_ids, or use POST /api/projects/{id}/render-all.",
             status_code=422,
         )
-    project_id = ""
-    with_render = []
-    for clip_id in payload.clip_ids:
-        clip = clip_service.get_clip(clip_id)
-        project_id = project_id or clip["project_id"]
-        with_render.append(clip_id)
-    result = manager().enqueue_all(project_id, with_render, export=payload.export)
+    project_ids = {clip_service.get_clip(clip_id)["project_id"] for clip_id in dict.fromkeys(payload.clip_ids)}
+    if len(project_ids) > 1:
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message="Those clips belong to different projects.",
+            hint="Render one project's clips at a time.",
+            status_code=422,
+        )
+    project_id = project_ids.pop()
+    result = manager().enqueue_all(project_id, list(dict.fromkeys(payload.clip_ids)), export=payload.export, priority=payload.priority)
     return {**result, "queue": _queue(project_id)}
 
 
@@ -60,93 +83,60 @@ def delete_clip(clip_id: str, remove_files: bool = Query(True)):
 
 
 @router.post("/{clip_id}/render")
-def render_clip(clip_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
-    body = payload or {}
-    job = manager().enqueue_render(
-        clip_id,
-        export=bool(body.get("export", False)),
-        overrides=body.get("overrides") or None,
-    )
+def render_clip(clip_id: str, payload: ClipRenderRequest | None = Body(default=None)):  # noqa: B008
+    """Queue the final render of one clip."""
+    body = payload or ClipRenderRequest()
     clip = clip_service.get_clip(clip_id)
+    job = manager().enqueue_render(clip_id, export=body.export, overrides=body.overrides or None)
     return {"job": job, "clip_id": clip_id, "queue": _queue(clip["project_id"])}
 
 
 @router.post("/{clip_id}/preview")
-def preview_clip(clip_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
+def preview_clip(clip_id: str, payload: ClipPreviewRequest | None = Body(default=None)):  # noqa: B008
     """Render a fast low-resolution preview (separate from the final render)."""
-    body = payload or {}
-    job = manager().enqueue_preview(clip_id, priority=int(body.get("priority", 2)))
+    body = payload or ClipPreviewRequest()
     clip = clip_service.get_clip(clip_id)
+    job = manager().enqueue_preview(clip_id, priority=body.priority)
     return {"job": job, "clip_id": clip_id, "queue": _queue(clip["project_id"])}
 
 
 @router.post("/{clip_id}/cancel")
 def cancel_clip_render(clip_id: str):
-    clip = clip_service.get_clip(clip_id)
-    from ...jobs import queue as job_queue
-
-    jobs = job_queue.list_jobs(project_id=clip["project_id"], statuses=("queued", "running"), limit=100)
-    cancelled = 0
+    """Cancel this clip's queued or running renders and previews."""
+    clip_service.get_clip(clip_id)  # 404 for unknown clips
+    jobs = job_queue.active_jobs(clip_id=clip_id)
     for job in jobs:
-        if job.get("clip_id") == clip_id:
-            manager().cancel(job["id"])
-            cancelled += 1
-    return {"cancelled": cancelled, "clip_id": clip_id}
+        manager().cancel(job["id"])
+    return {"cancelled": len(jobs), "clip_id": clip_id}
 
 
 @router.post("/{clip_id}/regenerate")
-def regenerate_clip(clip_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
+def regenerate_clip(clip_id: str, payload: RegenerateRequest | None = Body(default=None)):  # noqa: B008
     """Re-examine the neighbourhood and keep the strongest moment in it."""
-    body = payload or {}
-    result = clip_service.regenerate_clip(
-        clip_id,
-        window=float(body.get("window", 120.0)),
-        use_llm=bool(body.get("use_llm", True)),
-    )
+    body = payload or RegenerateRequest()
+    result = clip_service.regenerate_clip(clip_id, window=body.window, use_llm=body.use_llm)
     events.publish("clip.regenerated", {"clip_id": clip_id, "clip": result}, project_id=result["project_id"])
     return result
 
 
-@router.post("/{clip_id}/duplicate")
+@router.post("/{clip_id}/duplicate", status_code=201)
 def duplicate_clip(clip_id: str):
-    from ...db import Clip, session_scope
-
-    detail = clip_service.clip_detail(clip_id)
-    with session_scope() as session:
-        original = session.get(Clip, clip_id)
-        if original is None:
-            raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Clip not found.", status_code=404)
-        clone = Clip(
-            project_id=original.project_id,
-            candidate_id=original.candidate_id,
-            index=original.index,
-            title=f"{original.title} (copy)"[:300],
-            hook=original.hook,
-            summary=original.summary,
-            category=original.category,
-            score=original.score,
-            why_json=original.why_json,
-            factors_json=original.factors_json,
-            start=original.start,
-            end=original.end,
-            duration=original.duration,
-            words_json=original.words_json,
-            segments_json=original.segments_json,
-            trim_json=original.trim_json,
-            layout_json=original.layout_json,
-            status="pending",
-        )
-        session.add(clone)
-        session.flush()
-        clone_id = clone.id
-    return clip_service.clip_detail(clone_id)
+    """Copy a clip (with its edits) as a new clip that can be changed independently."""
+    clone = clip_service.duplicate_clip(clip_id)
+    events.publish("clip.created", {"clip_id": clone["id"], "source": clip_id}, project_id=clone["project_id"])
+    return clone
 
 
 @router.get("/{clip_id}/captions")
-def get_captions(clip_id: str, preset: str = Query(""), theme: str = Query("")):
-    import json
-
-    parsed = json.loads(theme) if theme else None
+def get_captions(clip_id: str, preset: str = Query(""), theme: str = Query("", description="JSON object of caption theme overrides")):
+    parsed: dict[str, Any] | None = None
+    if theme:
+        try:
+            parsed = json.loads(theme)
+        except ValueError as exc:
+            raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message="theme must be a JSON object.", status_code=422) from exc
+        if not isinstance(parsed, dict):
+            raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message="theme must be a JSON object.", status_code=422)
     return clip_service.caption_preview(clip_id, preset=preset or None, theme=parsed)
 
 
@@ -155,10 +145,22 @@ def preview_captions(clip_id: str, payload: CaptionPreviewRequest):
     return clip_service.caption_preview(clip_id, preset=payload.preset, theme=payload.theme)
 
 
+@captions_router.post("/captions/preview")
+def preview_caption_style(payload: CaptionPreviewRequest):
+    """Caption lines in a style - for ``clip_id``'s words, or sample text when it is empty."""
+    return clip_service.caption_preview(payload.clip_id, preset=payload.preset, theme=payload.theme)
+
+
 @router.get("/{clip_id}/captions/srt", response_class=PlainTextResponse)
 def download_srt(clip_id: str):
     path = clip_service.write_clip_srt(clip_id)
-    return PlainTextResponse(path.read_text(encoding="utf-8-sig"), media_type="application/x-subrip")
+    clip = clip_service.get_clip(clip_id)
+    filename = f"{_safe_filename(clip.get('title') or clip_id)}.srt"
+    return PlainTextResponse(
+        path.read_text(encoding="utf-8-sig"),
+        media_type="application/x-subrip; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{clip_id}/command")
@@ -169,10 +171,8 @@ def get_command(clip_id: str, quality: str = Query("final", pattern="^(final|pre
 
 @router.get("/{clip_id}/preview")
 def stream_preview(clip_id: str, request: Request):
-    detail = clip_service.get_clip(clip_id)
-    path = detail.get("has_preview") and None
-    with_path = clip_service.get_clip(clip_id)
-    target = _path_of(clip_id, "preview_path") or (with_path.get("render_url") and _path_of(clip_id, "file_path"))
+    """The low-res preview - or the final render when there is no preview."""
+    target = _existing(_path_of(clip_id, "preview_path")) or _existing(_path_of(clip_id, "file_path"))
     if not target:
         raise ClipForgeError(
             code=ErrorCode.NOT_FOUND,
@@ -193,8 +193,6 @@ def stream_file_route(clip_id: str, request: Request, download: bool = Query(Fal
             hint="Press Render to create the final video.",
             status_code=404,
         )
-    from pathlib import Path
-
     path = require_file(target)
     return stream_file(path, request, download_name=path.name if download else None, cache_seconds=3600)
 
@@ -218,7 +216,20 @@ def download_subtitles(clip_id: str):
 
 @router.get("/{clip_id}/assets")
 def clip_asset_options(clip_id: str):
+    """Assets this clip can use (enabled library items per kind)."""
+    clip_service.get_clip(clip_id)  # 404 for unknown clips
     return clip_service.clip_assets_options()
+
+
+def _existing(path_text: str) -> str:
+    from pathlib import Path
+
+    return path_text if path_text and Path(path_text).is_file() else ""
+
+
+def _safe_filename(text: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in " -_" else "_" for char in text).strip()
+    return (cleaned or "captions")[:80]
 
 
 def _path_of(clip_id: str, field: str) -> str:
@@ -237,4 +248,4 @@ def _queue(project_id: str) -> dict:
     return job_queue.queue_state(project_id)
 
 
-__all__ = ["router"]
+__all__ = ["captions_router", "router"]

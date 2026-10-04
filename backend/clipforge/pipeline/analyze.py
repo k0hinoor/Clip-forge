@@ -13,10 +13,13 @@ with an actionable message.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+from pydantic import ValidationError
 
 from ..ai import candidates as discover_mod
 from ..ai import language as language_mod
@@ -27,7 +30,7 @@ from ..ai.llm import LLMStatus, discover_moments
 from ..ai.llm import status as llm_status
 from ..ai.segment import build_blocks, build_sentences, sentence_map
 from ..ai.transcribe import Transcript, Utterance, transcribe, transcription_available
-from ..config import AppSettings, get_settings
+from ..config import AppSettings, describe_validation_error, get_settings, merge_settings_patch
 from ..constants import progress_for
 from ..db import Candidate, Clip, Project, session_scope, utcnow
 from ..errors import ClipForgeError, ErrorCode
@@ -91,11 +94,7 @@ class AnalysisOutcome:
 
 def project_settings(project: Project) -> AppSettings:
     """Merge global settings with the per-project overrides chosen on Create."""
-    base = get_settings().model_dump()
-    overrides = {key: value for key, value in project.settings.items() if key in base}
-    if overrides:
-        base = {**base, **overrides}
-    return AppSettings.model_validate(base)
+    return project_settings_from_snapshot({"settings": project.settings})
 
 
 def _update_project(project_id: str, **fields: Any) -> None:
@@ -253,6 +252,11 @@ def analyze(
 
     # ---------------------------------------------------------- 5. transcribe
     transcript = _transcribe(media_path, audio_path, paths, settings, metadata, report, language_profile)
+    for warning in transcript.warnings:
+        report.log(warning)
+    if transcript.translated:
+        language_profile = _translated_profile(language_profile, transcript)
+        write_analysis_files(paths, "language", language_profile.to_dict())
     report.stage("transcribe", "transcript complete", fraction=1.0)
     report.sub(1.0, f"{transcript.word_count} words · {transcript.language} · {transcript.engine}")
 
@@ -426,6 +430,9 @@ def analyze(
             project.error_message = ""
             project.error_hint = ""
 
+    if not settings.keep_source_audio:
+        _remove_extracted_audio(paths)
+
     log.info(
         "analysis finished for %s: %d candidates -> %d clips in %.1fs",
         project_id,
@@ -452,9 +459,25 @@ def analyze(
 
 
 def project_settings_from_snapshot(snapshot: dict[str, Any]) -> AppSettings:
+    """Global settings with a project's stored overrides applied on top.
+
+    The caption theme is merged rather than replaced, so a project that only
+    chose a caption preset keeps the rest of the user's caption settings. An
+    override that no longer validates (e.g. saved by an older version) is
+    skipped instead of breaking the analysis or the render.
+    """
     base = get_settings().model_dump()
     overrides = {key: value for key, value in (snapshot.get("settings") or {}).items() if key in base}
-    return AppSettings.model_validate({**base, **overrides})
+    try:
+        return AppSettings.model_validate(merge_settings_patch(base, overrides))
+    except ValidationError as exc:
+        log.warning("ignoring invalid project overrides (%s)", describe_validation_error(exc))
+        broken = {str(error["loc"][0]) for error in exc.errors() if error.get("loc")}
+        usable = {key: value for key, value in overrides.items() if key not in broken}
+        try:
+            return AppSettings.model_validate(merge_settings_patch(base, usable))
+        except ValidationError:
+            return get_settings()
 
 
 def _find_existing_media(paths: ProjectPaths) -> Path | None:
@@ -484,8 +507,11 @@ def _download_source(
     if settings.cache_downloads and cache_target.exists() and cache_target.stat().st_size > 4096:
         report.sub(1.0, "reusing the cached download for this video")
         report.log(f"using cached source {cache_target.name}")
-        media_path = link_or_copy(cache_target, paths.source / cache_target.name)
-        return media_path
+        try:
+            os.utime(cache_target)  # recently used: storage cleanup expires by age
+        except OSError:
+            pass
+        return link_or_copy(cache_target, paths.source / cache_target.name)
 
     def on_progress(fraction: float, message: str) -> None:
         report.sub(fraction, message)
@@ -540,7 +566,8 @@ def _detect_language(
             if not sample_path.exists():
                 extract_audio(media_path, sample_path, sample_rate=16000, mono=True, duration=probe_seconds)
             report.sub(0.3, "listening to the opening minutes")
-            sample_settings = settings.model_copy(update={"whisper_beam_size": 1, "whisper_vad": True})
+            # The probe must hear the spoken language, never a translation.
+            sample_settings = settings.model_copy(update={"whisper_beam_size": 1, "whisper_vad": True, "translate_captions": False})
             transcript = transcribe(sample_path, settings=sample_settings)
             whisper_language = transcript.language
             confidence = transcript.language_confidence
@@ -584,6 +611,13 @@ def _transcribe(
         return provided
 
     if transcription_available():
+        cache_key = _transcript_cache_key(media_path, settings)
+        if settings.cache_transcripts:
+            cached = _load_cached_transcript(paths, cache_key)
+            if cached is not None:
+                report.sub(1.0, f"reusing the transcript from the previous analysis ({cached.word_count} words)")
+                report.log("speech recognition skipped: the cached transcript matches this source and these settings")
+                return cached
         try:
             transcript = transcribe(
                 audio_path,
@@ -595,6 +629,8 @@ def _transcribe(
                 json.dumps({"engine": transcript.engine, "model": transcript.model, "language": transcript.language}, indent=1),
                 encoding="utf-8",
             )
+            if settings.cache_transcripts:
+                _store_cached_transcript(paths, cache_key, transcript)
             return transcript
         except ClipForgeError as exc:
             if exc.code == ErrorCode.CANCELLED:
@@ -603,6 +639,79 @@ def _transcribe(
             log.warning("transcription failed, trying caption fallback: %s", exc.message)
 
     return _transcribe_from_captions(paths, settings, metadata, report, profile)
+
+
+TRANSCRIPT_CACHE_FILE = "asr_cache.json"
+
+
+def _transcript_cache_key(media_path: Path, settings: AppSettings) -> dict[str, Any]:
+    """Everything that changes what speech recognition would produce."""
+    try:
+        size = media_path.stat().st_size
+    except OSError:
+        size = 0
+    return {
+        "source": media_path.name,
+        "size": size,
+        "model": settings.whisper_model,
+        "language_hint": settings.language_hint,
+        "translate": settings.translate_captions,
+        "alignment": settings.word_alignment,
+        "vad": settings.whisper_vad,
+        "beam": settings.whisper_beam_size,
+        "prompt": settings.whisper_initial_prompt,
+    }
+
+
+def _load_cached_transcript(paths: ProjectPaths, key: dict[str, Any]) -> Transcript | None:
+    cache_file = paths.transcript / TRANSCRIPT_CACHE_FILE
+    if not cache_file.exists():
+        return None
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        if payload.get("key") != key:
+            return None
+        return Transcript.from_dict(payload["transcript"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        log.warning("ignoring unreadable transcript cache %s: %s", cache_file, exc)
+        return None
+
+
+def _store_cached_transcript(paths: ProjectPaths, key: dict[str, Any], transcript: Transcript) -> None:
+    try:
+        paths.transcript.mkdir(parents=True, exist_ok=True)
+        (paths.transcript / TRANSCRIPT_CACHE_FILE).write_text(
+            json.dumps({"key": key, "transcript": transcript.to_dict()}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:  # caching is an optimisation
+        log.warning("could not cache the transcript: %s", exc)
+
+
+def _translated_profile(profile: language_mod.LanguageProfile, transcript: Transcript) -> language_mod.LanguageProfile:
+    """The captions are English now; remember what was actually spoken."""
+    spoken = transcript.source_language or profile.primary
+    spoken_name = language_mod.language_name(spoken)
+    return language_mod.LanguageProfile(
+        primary="en",
+        primary_name="English",
+        secondary=spoken,
+        secondary_name=spoken_name,
+        mode="translated",
+        confidence=profile.confidence,
+        whistle_language=profile.whistle_language,
+        probabilities=profile.probabilities,
+        notes=[*profile.notes, f"Speech in {spoken_name} was translated to English for the captions."],
+    )
+
+
+def _remove_extracted_audio(paths: ProjectPaths) -> None:
+    """Drop the speech-recognition WAVs (``keep_source_audio`` off); re-analysis re-extracts them."""
+    for name in ("speech_16k.wav", "language_probe.wav"):
+        try:
+            (paths.audio / name).unlink(missing_ok=True)
+        except OSError as exc:
+            log.debug("could not remove %s: %s", name, exc)
 
 
 def _transcript_from_files(

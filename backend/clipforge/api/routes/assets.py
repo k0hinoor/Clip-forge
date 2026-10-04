@@ -5,14 +5,14 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 
 from ...config import Env, get_settings
 from ...errors import ClipForgeError, ErrorCode
 from ...logging_setup import get_logger
 from ...media import assets as asset_service
-from ...media.download import safe_upload_path
 from ...services import events
+from ...system import require_local_paths
 from ..media import require_file, stream_file
 from ..schemas import AssetImportRequest, AssetUpdate
 
@@ -29,6 +29,11 @@ def list_assets(
     return {
         "assets": asset_service.list_assets(kind or None, category or None, enabled_only=enabled_only),
         "library": asset_service.library_summary(),
+        "categories": {
+            "gameplay": list(asset_service.GAMEPLAY_CATEGORIES),
+            "broll": list(asset_service.BROLL_CATEGORIES),
+            "music": list(asset_service.MUSIC_MOODS),
+        },
     }
 
 
@@ -61,20 +66,56 @@ def get_music(category: str = Query(""), enabled_only: bool = Query(True)):
 @router.post("/upload", status_code=201)
 async def upload_asset(
     file: UploadFile = File(...),
-    kind: str = Form("gameplay"),
+    kind: str = Form("gameplay", pattern="^(gameplay|broll|music)$"),
     category: str = Form("general"),
     name: str = Form(""),
 ):
     """Import a gameplay / B-roll / music file into the library."""
+    settings = get_settings()
+    if not settings.uploads_enabled:
+        raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message="Uploads are disabled in Settings -> Downloads & uploads.", status_code=403)
+    filename = Path(file.filename or "asset.mp4").name
+    suffix = Path(filename).suffix.lower()
+    allowed = asset_service.VIDEO_EXTENSIONS | asset_service.AUDIO_EXTENSIONS | asset_service.IMAGE_EXTENSIONS
+    if suffix not in allowed:
+        await file.close()
+        raise ClipForgeError(
+            code=ErrorCode.ASSET_FAILED,
+            message=f"{suffix or 'That file type'} cannot be imported.",
+            hint="Supported: " + ", ".join(sorted(allowed)),
+            status_code=422,
+        )
     cache = Env.DATA_DIR / "cache"
     cache.mkdir(parents=True, exist_ok=True)
-    suffix = Path(file.filename or "asset.mp4").suffix.lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(cache)) as handle:
+    limit = int(settings.max_upload_gb * 1024**3)
+    written = 0
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(cache), prefix="upload_") as handle:
         temp_path = Path(handle.name)
-        while chunk := await file.read(1024 * 1024 * 4):
-            handle.write(chunk)
+        try:
+            while chunk := await file.read(1024 * 1024 * 4):
+                written += len(chunk)
+                if written > limit:
+                    raise ClipForgeError(
+                        code=ErrorCode.UPLOAD_TOO_LARGE,
+                        message=f"That file is larger than the {settings.max_upload_gb:g} GB upload limit.",
+                        hint="Raise the limit in Settings -> Downloads & uploads, or trim the file first.",
+                        status_code=413,
+                    )
+                handle.write(chunk)
+        except BaseException:
+            handle.close()
+            temp_path.unlink(missing_ok=True)
+            await file.close()
+            raise
     try:
-        asset = asset_service.import_asset(temp_path, kind=kind, category=category, name=name or Path(file.filename or "asset").stem)
+        asset = asset_service.import_asset(
+            temp_path,
+            kind=kind,
+            category=category,
+            name=name or Path(filename).stem,
+            move=True,
+            filename=filename,
+        )
     finally:
         temp_path.unlink(missing_ok=True)
         await file.close()
@@ -84,16 +125,17 @@ async def upload_asset(
 
 @router.post("/import-path", status_code=201)
 def import_from_path(payload: AssetImportRequest):
-    """Import a file that already exists on this machine (no upload needed)."""
+    """Import a file that already exists on this machine (desktop app only)."""
+    require_local_paths("Importing a file by path")
     source = Path(payload.path).expanduser()
-    if not source.exists():
+    if not source.is_file():
         raise ClipForgeError(
             code=ErrorCode.NOT_FOUND,
             message=f"No file at {source}",
             hint="Check the path, or upload the file instead.",
             status_code=404,
         )
-    asset = asset_service.import_asset(source, kind=payload.kind, category=payload.category, name=payload.name, copy_file=payload.copy_file)
+    asset = asset_service.import_asset(source, kind=payload.kind, category=payload.category, name=payload.name, copy=payload.copy_file)
     events.publish("asset.imported", {"asset": asset})
     return {"asset": asset, "library": asset_service.library_summary()}
 

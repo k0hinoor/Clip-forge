@@ -25,7 +25,7 @@ from typing import Any, Callable, Iterable
 from ..config import AppSettings, get_settings
 from ..errors import ClipForgeError, ErrorCode
 from ..logging_setup import get_logger
-from ..system import ai_stack, hardware
+from ..system import ai_stack, fit_whisper_model, hardware
 
 log = get_logger("clipforge.ai")
 
@@ -79,6 +79,8 @@ class Transcript:
     diarized: bool = False
     speaker_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    translated: bool = False
+    source_language: str = ""
 
     @property
     def words(self) -> list[Word]:
@@ -95,6 +97,44 @@ class Transcript:
     def word_count(self) -> int:
         return sum(len(utterance.words) for utterance in self.utterances)
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "Transcript":
+        """Inverse of :meth:`to_dict` (used by the transcript cache)."""
+        utterances = [
+            Utterance(
+                text=str(item.get("text", "")),
+                start=float(item.get("start", 0.0)),
+                end=float(item.get("end", 0.0)),
+                speaker=str(item.get("speaker") or "SPEAKER_01"),
+                confidence=float(item.get("confidence", 0.0)),
+                words=[
+                    Word(
+                        word=str(word.get("word", "")),
+                        start=float(word.get("start", 0.0)),
+                        end=float(word.get("end", 0.0)),
+                        confidence=float(word.get("confidence", 0.0)),
+                        speaker=str(word.get("speaker", "")),
+                    )
+                    for word in item.get("words") or []
+                ],
+            )
+            for item in payload.get("utterances") or []
+        ]
+        return cls(
+            language=str(payload.get("language", "en")),
+            language_confidence=float(payload.get("language_confidence", 0.0)),
+            utterances=utterances,
+            engine=str(payload.get("engine", "")),
+            model=str(payload.get("model", "")),
+            duration=float(payload.get("duration", 0.0)),
+            language_probabilities=dict(payload.get("language_probabilities") or {}),
+            diarized=bool(payload.get("diarized", False)),
+            speaker_count=int(payload.get("speaker_count", 0)),
+            warnings=list(payload.get("warnings") or []),
+            translated=bool(payload.get("translated", False)),
+            source_language=str(payload.get("source_language", "")),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "language": self.language,
@@ -107,6 +147,8 @@ class Transcript:
             "speaker_count": self.speaker_count,
             "diarized": self.diarized,
             "warnings": self.warnings,
+            "translated": self.translated,
+            "source_language": self.source_language,
             "utterances": [
                 {
                     "text": utterance.text,
@@ -150,7 +192,12 @@ def _device_and_compute(settings: AppSettings) -> tuple[str, str]:
     return device, compute
 
 
-def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str]:
+def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str, str]:
+    """Load (or reuse) a faster-whisper model: ``(model, device, compute, model_name)``.
+
+    The model is downgraded when the configured one cannot fit in memory (see
+    :func:`clipforge.system.fit_whisper_model`); the reason is logged.
+    """
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError as exc:
@@ -162,18 +209,23 @@ def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str]:
         ) from exc
 
     device, compute = _device_and_compute(settings)
-    key = (settings.whisper_model, device, compute)
+    model_name = settings.whisper_model
+    if device == "cpu":
+        model_name, note = fit_whisper_model(settings.whisper_model)
+        if note:
+            log.warning(note)
+    key = (model_name, device, compute)
     with _MODEL_LOCK:
         cached = _MODELS.get(key)
         if cached is not None:
-            return cached, device, compute
+            return cached, device, compute, model_name
 
     model_dir = Path(settings.whisper_cache_dir) if getattr(settings, "whisper_cache_dir", "") else None
-    log.info("loading faster-whisper model=%s device=%s compute=%s", settings.whisper_model, device, compute)
+    log.info("loading faster-whisper model=%s device=%s compute=%s", model_name, device, compute)
     started = time.time()
     try:
         model = WhisperModel(
-            settings.whisper_model,
+            model_name,
             device=device,
             compute_type=compute,
             download_root=str(model_dir) if model_dir else None,
@@ -185,8 +237,18 @@ def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str]:
         if "cuda" in message or "cublas" in message or "cudnn" in message:
             log.warning("CUDA init failed (%s); retrying on CPU", exc)
             device, compute = "cpu", "int8"
+            model_name, note = fit_whisper_model(settings.whisper_model)
+            if note:
+                log.warning(note)
+            key = (model_name, device, compute)
             try:
-                model = WhisperModel(settings.whisper_model, device="cpu", compute_type="int8", num_workers=1)
+                model = WhisperModel(
+                    model_name,
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=str(model_dir) if model_dir else None,
+                    num_workers=1,
+                )
             except Exception as exc2:  # noqa: BLE001
                 raise ClipForgeError(
                     code=ErrorCode.WHISPER_FAILED,
@@ -198,7 +260,7 @@ def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str]:
         else:
             raise ClipForgeError(
                 code=ErrorCode.WHISPER_FAILED,
-                message=f"The Whisper model '{settings.whisper_model}' could not be loaded.",
+                message=f"The Whisper model '{model_name}' could not be loaded.",
                 hint="Check the model name (tiny, base, small, medium, large-v3) and your internet connection for the first download.",
                 detail=str(exc),
                 status_code=500,
@@ -206,8 +268,8 @@ def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str]:
 
     with _MODEL_LOCK:
         _MODELS[key] = model
-    log.info("faster-whisper %s ready in %.1fs", settings.whisper_model, time.time() - started)
-    return model, device, compute
+    log.info("faster-whisper %s ready in %.1fs", model_name, time.time() - started)
+    return model, device, compute, model_name
 
 
 def unload_models() -> None:
@@ -230,7 +292,7 @@ def transcribe_faster_whisper(
     language: str | None = None,
 ) -> Transcript:
     settings = settings or get_settings()
-    model, device, compute = _load_faster_whisper(settings)
+    model, device, compute, model_name = _load_faster_whisper(settings)
     audio = str(audio_path)
 
     kwargs: dict[str, Any] = {
@@ -240,7 +302,8 @@ def transcribe_faster_whisper(
         "condition_on_previous_text": settings.whisper_condition_on_previous_text,
         "temperature": 0.0,
         "language": language or settings.language_hint or None,
-        "task": "transcribe",  # never translate unless the user asks for it
+        # Never translate unless the user switched translation on.
+        "task": "translate" if settings.translate_captions else "transcribe",
     }
     if settings.whisper_vad:
         kwargs["vad_parameters"] = {
@@ -317,17 +380,36 @@ def transcribe_faster_whisper(
     probabilities = dict(getattr(info, "all_language_probs", None) or {})
     detected = getattr(info, "language", "") or "en"
     confidence = float(getattr(info, "language_probability", 0.0) or 0.0)
+    log.info("transcribed %s (%.0fs of audio) in %.1fs", Path(audio).name, duration, time.time() - started)
 
-    return Transcript(
+    warnings = [] if confidence >= 0.6 else ["Language detection confidence is low; captions may need review."]
+    if model_name != settings.whisper_model:
+        warnings.append(fit_whisper_model(settings.whisper_model)[1] or f"Used the '{model_name}' model.")
+    transcript = Transcript(
         language=detected,
         language_confidence=confidence,
         utterances=utterances,
         engine=f"faster-whisper ({device}/{compute})",
-        model=settings.whisper_model,
+        model=model_name,
         duration=duration or (utterances[-1].end if utterances else 0.0),
         language_probabilities=probabilities,
-        warnings=[] if confidence >= 0.6 else ["Language detection confidence is low; captions may need review."],
+        warnings=warnings,
     )
+    return _mark_translated(transcript) if settings.translate_captions else transcript
+
+
+def _mark_translated(transcript: Transcript) -> Transcript:
+    """Label a Whisper ``task="translate"`` result: the text is English now."""
+    spoken = transcript.language or "unknown"
+    transcript.source_language = spoken
+    transcript.translated = spoken != "en"
+    transcript.language = "en"
+    if transcript.translated:
+        transcript.engine = f"{transcript.engine} - translated"
+        transcript.warnings.append(
+            f"Speech in '{spoken}' was translated to English by Whisper; word timings in translated captions are approximate."
+        )
+    return transcript
 
 
 def _repair_word_times(words: list[Word], segment_start: float, segment_end: float) -> list[Word]:
@@ -392,7 +474,18 @@ def transcribe_whisperx(
     audio = whisperx.load_audio(str(audio_path))
     if progress:
         progress(0.15, "transcribing")
-    result = model.transcribe(audio, batch_size=max(1, settings.whisper_batch_size), language=settings.language_hint or None)
+    task = "translate" if settings.translate_captions else "transcribe"
+    try:
+        result = model.transcribe(audio, batch_size=max(1, settings.whisper_batch_size), language=settings.language_hint or None, task=task)
+    except TypeError:  # older WhisperX without the task argument
+        if task == "translate":
+            raise ClipForgeError(
+                code=ErrorCode.WHISPER_FAILED,
+                message="This WhisperX version cannot translate.",
+                hint="Set Word alignment to 'auto' so faster-whisper handles translation, or update WhisperX.",
+                status_code=500,
+            ) from None
+        result = model.transcribe(audio, batch_size=max(1, settings.whisper_batch_size), language=settings.language_hint or None)
     language = result.get("language", "en")
 
     utterances: list[Utterance] = []
@@ -409,18 +502,21 @@ def transcribe_whisperx(
             )
         )
 
-    try:  # forced alignment for accurate word timings
-        if progress:
-            progress(0.55, "aligning word timestamps")
-        align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
-        aligned = whisperx.align(result["segments"], align_model, metadata, audio, device, return_char_alignments=False)
-        utterances = _utterances_from_whisperx(aligned.get("segments", []), utterances)
-    except Exception as exc:  # noqa: BLE001 - alignment is best-effort
-        log.warning("WhisperX alignment failed (%s); falling back to segment timings", exc)
+    # Forced alignment matches text against the spoken audio, which is
+    # meaningless for a translation - translated captions keep segment timings.
+    if task == "transcribe":
+        try:
+            if progress:
+                progress(0.55, "aligning word timestamps")
+            align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
+            aligned = whisperx.align(result["segments"], align_model, metadata, audio, device, return_char_alignments=False)
+            utterances = _utterances_from_whisperx(aligned.get("segments", []), utterances)
+        except Exception as exc:  # noqa: BLE001 - alignment is best-effort
+            log.warning("WhisperX alignment failed (%s); falling back to segment timings", exc)
 
     if progress:
         progress(0.9, "finalising transcript")
-    return Transcript(
+    transcript = Transcript(
         language=language,
         language_confidence=0.9,
         utterances=utterances,
@@ -428,6 +524,7 @@ def transcribe_whisperx(
         model=settings.whisper_model,
         duration=utterances[-1].end if utterances else 0.0,
     )
+    return _mark_translated(transcript) if task == "translate" else transcript
 
 
 def _utterances_from_whisperx(segments: list[dict[str, Any]], fallback: list[Utterance]) -> list[Utterance]:
@@ -474,7 +571,10 @@ def transcribe(
     settings = settings or get_settings()
     stack = ai_stack()
 
-    if settings.word_alignment == "whisperx" and stack.get("whisperx"):
+    # WhisperX's forced alignment cannot help a translation, so faster-whisper
+    # handles translated runs whenever it is installed.
+    prefer_whisperx = settings.word_alignment == "whisperx" and not (settings.translate_captions and stack.get("faster_whisper"))
+    if prefer_whisperx and stack.get("whisperx"):
         try:
             return transcribe_whisperx(audio_path, settings=settings, progress=progress)
         except ClipForgeError as exc:

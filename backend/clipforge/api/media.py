@@ -8,7 +8,6 @@ serve anything outside the data directory.
 from __future__ import annotations
 
 import mimetypes
-import os
 import re
 from pathlib import Path
 from typing import Iterator

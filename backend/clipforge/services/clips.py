@@ -9,26 +9,31 @@ plan the user is looking at.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..ai.features import TranscriptIndex
-from ..ai.language import detect_language
 from ..ai.segment import Sentence, build_blocks, build_sentences
 from ..ai.transcribe import Utterance, Word
-from ..config import AppSettings, CaptionTheme, get_settings
+from ..config import AppSettings, CaptionTheme, get_settings, merge_settings_patch
+from ..constants import CAPTION_PRESETS
 from ..db import Clip, Project, TranscriptSegment, session_scope
 from ..errors import ClipForgeError, ErrorCode, not_found
 from ..logging_setup import get_logger
 from ..media.captions import plan_captions, preset_theme, write_srt
-from ..media.compose import RenderSpec, command_preview
-from ..media.framing import crop_plan_from_dict
-from ..media.timeline import build_timeline
+from ..media.compose import command_preview
 from ..pipeline.context import ProjectPaths, find_media
-from ..pipeline.edit import clip_settings, layout_payload, load_timeline, rebuild_layout, resolve_asset, set_layout_payload
+from ..pipeline.edit import (
+    clip_settings,
+    ensure_layout_asset,
+    layout_payload,
+    load_timeline,
+    plan_timeline,
+    rebuild_layout,
+    set_layout_payload,
+)
 from ..pipeline.render import project_settings_for
 
 log = get_logger("clipforge.worker")
@@ -147,13 +152,20 @@ def clip_detail(clip_id: str) -> dict[str, Any]:
             "broll": layout.get("broll"),
             "music": layout.get("music"),
             "notes": layout.get("notes") or [],
-            "zoom_points": layout.get("zoom_points") or [],
+            "zoom_points": plan.get("zoom_points") or layout.get("zoom_points") or [],
             "crop": plan.get("crop"),
             "timeline": timeline.to_dict(),
         },
         "captions": captions,
         "captions_enabled": bool(settings.captions_enabled),
-        "caption_presets": sorted({*(layout.get("caption_presets") or []), "minimal", "cinematic", "bold_creator", "karaoke", "highlight", "documentary"}),
+        "caption_presets": sorted(CAPTION_PRESETS),
+        "settings": {
+            "aspect_ratio": settings.aspect_ratio,
+            "remove_silence": settings.remove_silence,
+            "auto_zoom": settings.auto_zoom,
+            "gameplay_enabled": settings.gameplay_enabled,
+            "music_enabled": settings.music_enabled,
+        },
         "needs_render": payload["status"] != "rendered",
     }
     return detail
@@ -193,77 +205,38 @@ def update_clip(clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
     new_start = patch.get("start")
     new_end = patch.get("end")
     if new_start is not None or new_end is not None:
-        with session_scope() as session:
-            clip = session.get(Clip, clip_id)
-            start = float(new_start if new_start is not None else clip.start)
-            end = float(new_end if new_end is not None else clip.end)
-        if end - start < 5:
-            raise ClipForgeError(
-                code=ErrorCode.INVALID_INPUT,
-                message="A clip must be at least 5 seconds long.",
-                status_code=422,
-            )
-        if end - start > max(settings.max_clip_seconds * 3, 300):
-            raise ClipForgeError(
-                code=ErrorCode.INVALID_INPUT,
-                message="That clip is far longer than the configured maximum.",
-                hint="Adjust the maximum clip duration in Settings -> Video first.",
-                status_code=422,
-            )
-        sentences = load_project_sentences(project_id)
-        words = words_in_range(sentences, start, end)
-        if not words:
-            raise ClipForgeError(
-                code=ErrorCode.INVALID_INPUT,
-                message="No speech was found in that range.",
-                hint="Pick a range that contains spoken words.",
-                status_code=422,
-            )
-        timeline = build_timeline(start, end, [], settings=settings)
-        with session_scope() as session:
-            clip = session.get(Clip, clip_id)
-            clip.start, clip.end = start, end
-            clip.duration = round(end - start, 3)
-            clip.words_json = json.dumps([word.to_dict() for word in words])
-            clip.trim_json = json.dumps(timeline.to_dict())
-            clip.status = "pending"
-            clip.file_path = clip.file_path  # keep the last render visible but mark it stale
-            clip.progress = 0.0
+        _retime_clip(clip_id, project_id, new_start, new_end, clip_settings(settings, layout), plan)
         structural = True
 
-    layout_keys = {
-        "layout": patch.get("layout"),
-        "split_ratio": patch.get("split_ratio"),
-        "captions_enabled": patch.get("captions_enabled"),
-        "remove_silence": patch.get("remove_silence"),
-        "auto_zoom": patch.get("auto_zoom"),
-        "gameplay_enabled": patch.get("gameplay_enabled"),
-        "music_enabled": patch.get("music_enabled"),
-        "aspect_ratio": patch.get("aspect_ratio"),
-    }
-    if any(value is not None for value in layout_keys.values()):
+    layout_keys = {key: patch.get(key) for key in LAYOUT_PATCH_KEYS}
+    for key, value in layout_keys.items():
+        if value is not None:
+            layout[key] = value
+            structural = True
+
+    if layout_keys["remove_silence"] is not None and new_start is None and new_end is None:
+        # Pacing is baked into the stored timeline, so recompute it.
+        _retime_clip(clip_id, project_id, None, None, clip_settings(settings, layout), plan)
+
+    for kind in ("gameplay", "broll", "music"):
+        asset_id = patch.get(f"{kind}_asset_id")
+        if asset_id is None:
+            continue
+        layout[kind] = _asset_entry(kind, str(asset_id)) if asset_id else None
         structural = True
-        for key, value in layout_keys.items():
-            if value is not None:
-                layout[key] = value
-        if patch.get("gameplay_asset_id") is not None:
-            asset_id = patch["gameplay_asset_id"]
-            from ..media.assets import list_assets
 
-            match = next((asset for asset in list_assets("gameplay") if asset["id"] == asset_id), None)
-            layout["gameplay"] = {"id": asset_id, "name": match["name"] if match else asset_id, "path": match["path"] if match else "", "reason": "manually selected"}
-        if patch.get("music_asset_id") is not None:
-            asset_id = patch["music_asset_id"]
-            from ..media.assets import list_assets
-
-            match = next((asset for asset in list_assets("music") if asset["id"] == asset_id), None)
-            layout["music"] = {"id": asset_id, "name": match["name"] if match else asset_id, "path": match["path"] if match else "", "reason": "manually selected"}
+    asset_change = any(patch.get(f"{kind}_asset_id") is not None for kind in ("gameplay", "broll", "music"))
+    if asset_change or layout_keys.get("layout") or layout_keys.get("gameplay_enabled") or layout_keys.get("music_enabled"):
+        note = ensure_layout_asset(
+            layout,
+            clip_settings(settings, layout),
+            clip_key=f"{project_id}:{clip_id}",
+            category=str(patch.get("category") or ""),
+        )
+        if note:
+            layout["notes"] = [*(layout.get("notes") or []), note][-12:]
 
     if patch.get("caption_preset"):
-        # The editor sends a preset name; turn it into the theme it defines and
-        # store that, so the render reads back exactly what the user picked.
-        from ..constants import CAPTION_PRESETS
-
         preset_name = str(patch["caption_preset"])
         if preset_name not in CAPTION_PRESETS:
             raise ClipForgeError(
@@ -272,21 +245,18 @@ def update_clip(clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
                 hint="Choose one of: " + ", ".join(sorted(CAPTION_PRESETS)),
                 status_code=422,
             )
-        layout["caption"] = preset_theme(preset_name, settings.caption).model_dump()
-        structural = True
 
-    if patch.get("caption") is not None:
-        structural = True
-        theme = settings.caption.model_dump()
-        theme.update({key: value for key, value in patch["caption"].items() if key in theme})
+    if patch.get("caption_preset") or patch.get("caption") is not None:
+        # Same rules as Settings: a preset applies its look, explicit keys win.
+        current = {**settings.caption.model_dump(), **(layout.get("caption") or {})}
+        caption_patch = dict(patch.get("caption") or {})
+        if patch.get("caption_preset"):
+            caption_patch.setdefault("preset", str(patch["caption_preset"]))
+        merged = merge_settings_patch({"caption": current}, {"caption": caption_patch})["caption"]
         try:
-            layout["caption"] = CaptionTheme.model_validate(theme).model_dump()
-        except Exception as exc:  # noqa: BLE001
-            raise ClipForgeError(
-                code=ErrorCode.INVALID_INPUT,
-                message=f"That caption style could not be applied: {exc}",
-                status_code=422,
-            ) from exc
+            layout["caption"] = CaptionTheme.model_validate({key: value for key, value in merged.items() if key in CaptionTheme.model_fields}).model_dump()
+        except ValueError as exc:
+            raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message=f"That caption style could not be applied: {exc}", status_code=422) from exc
         structural = True
 
     with session_scope() as session:
@@ -301,25 +271,126 @@ def update_clip(clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             clip.stage = "edited"
         session.flush()
         payload = clip.to_dict(include_words=True)
-    changed = sorted({*(overrides.keys()), *(key for key, value in layout_keys.items() if value is not None),
-                      *(("caption_preset",) if patch.get("caption_preset") else ()),
-                      *(("caption",) if patch.get("caption") is not None else ())})
-    log.info("clip %s updated (%s)", clip_id, ", ".join(changed))
+    log.info("clip %s updated (%s)", clip_id, ", ".join(sorted(patch)))
     return {**payload, "needs_render": payload["status"] != "rendered"}
 
 
+# Plan keys the editor can set directly (see pipeline.edit.CLIP_SETTING_KEYS).
+LAYOUT_PATCH_KEYS = ("layout", "split_ratio", "captions_enabled", "remove_silence", "auto_zoom", "gameplay_enabled", "music_enabled", "aspect_ratio")
+
+
+def _asset_entry(kind: str, asset_id: str) -> dict[str, Any]:
+    from ..media.assets import list_assets
+
+    match = next((asset for asset in list_assets(kind) if asset["id"] == asset_id), None)
+    if match is None:
+        raise ClipForgeError(
+            code=ErrorCode.NOT_FOUND,
+            message=f"That {'B-roll' if kind == 'broll' else kind} asset does not exist.",
+            hint="Pick one from the list, or import it in Assets first.",
+            status_code=404,
+        )
+    return {"id": asset_id, "name": match["name"], "category": match["category"], "path": match["path"], "reason": "chosen in the editor"}
+
+
+def _retime_clip(clip_id: str, project_id: str, new_start: float | None, new_end: float | None, settings: AppSettings, plan: dict[str, Any]) -> None:
+    """Move a clip's boundaries: words, pacing (silence removal) and punch-ins follow."""
+    with session_scope() as session:
+        clip = session.get(Clip, clip_id)
+        start = float(new_start if new_start is not None else clip.start)
+        end = float(new_end if new_end is not None else clip.end)
+        project = session.get(Project, project_id)
+        source = find_media(ProjectPaths.for_project(project).source) if project else None
+        project_duration = float(project.duration or 0.0) if project else 0.0
+    if project_duration and end > project_duration + 0.5:
+        raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message="The clip cannot end after the video does.", status_code=422)
+    if end - start < 5:
+        raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message="A clip must be at least 5 seconds long.", status_code=422)
+    if end - start > max(settings.max_clip_seconds * 3, 300):
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message="That clip is far longer than the configured maximum.",
+            hint="Raise the maximum clip length in Settings -> Clips first.",
+            status_code=422,
+        )
+    words = words_in_range(load_project_sentences(project_id), start, end)
+    if not words:
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message="No speech was found in that range.",
+            hint="Pick a range that contains spoken words.",
+            status_code=422,
+        )
+    timeline = plan_timeline(source, start, end, settings)
+    # Punch-ins are output-relative: keep those that still land inside the clip.
+    plan["zoom_points"] = [
+        point for point in plan.get("zoom_points") or [] if 0.3 <= float(point.get("time", 0)) <= timeline.output_duration - 0.4
+    ]
+    with session_scope() as session:
+        clip = session.get(Clip, clip_id)
+        clip.start, clip.end = start, end
+        clip.duration = round(timeline.output_duration, 3)
+        clip.words_json = json.dumps([word.to_dict() for word in words])
+        clip.trim_json = json.dumps(timeline.to_dict())
+
+
+def duplicate_clip(clip_id: str) -> dict[str, Any]:
+    """Copy a clip (plan, captions, layout) as a new, unrendered clip."""
+    with session_scope() as session:
+        original = session.get(Clip, clip_id)
+        if original is None:
+            raise not_found("Clip", clip_id)
+        # A fresh index: the clip folder (plan, captions) is keyed by it.
+        next_index = (session.execute(select(func.max(Clip.index)).where(Clip.project_id == original.project_id)).scalar_one() or 0) + 1
+        clone = Clip(
+            project_id=original.project_id,
+            candidate_id=original.candidate_id,
+            index=next_index,
+            title=f"{original.title} (copy)"[:300],
+            hook=original.hook,
+            summary=original.summary,
+            category=original.category,
+            score=original.score,
+            why_json=original.why_json,
+            factors_json=original.factors_json,
+            start=original.start,
+            end=original.end,
+            duration=original.duration,
+            words_json=original.words_json,
+            segments_json=original.segments_json,
+            trim_json=original.trim_json,
+            layout_json=original.layout_json,
+            status="pending",
+            stage="pending",
+        )
+        session.add(clone)
+        session.flush()
+        clone_id = clone.id
+        project = session.get(Project, original.project_id)
+        if project is not None:
+            project.clip_count = session.execute(select(func.count(Clip.id)).where(Clip.project_id == original.project_id)).scalar_one()
+    return clip_detail(clone_id)
+
+
 def delete_clip(clip_id: str, *, remove_files: bool = True) -> dict[str, Any]:
+    from ..jobs import queue as job_queue
+    from ..jobs.manager import manager
+
+    for job in job_queue.active_jobs(clip_id=clip_id):
+        manager().cancel(job["id"])
     with session_scope() as session:
         clip = session.get(Clip, clip_id)
         if clip is None:
             raise not_found("Clip", clip_id)
         project_id = clip.project_id
         paths_to_remove = [clip.file_path, clip.preview_path, clip.thumb_path, clip.subtitle_path]
+        if clip.subtitle_path:  # the exported .srt sits next to the burned-in .ass
+            paths_to_remove.append(str(Path(clip.subtitle_path).with_suffix(".srt")))
         session.delete(clip)
+        session.flush()
         project = session.get(Project, project_id)
         if project is not None:
-            remaining = session.query(Clip).filter(Clip.project_id == project_id).count()
-            project.clip_count = max(remaining - 1, 0)
+            project.clip_count = session.execute(select(func.count(Clip.id)).where(Clip.project_id == project_id)).scalar_one()
     if remove_files:
         for path_text in paths_to_remove:
             if not path_text:
@@ -369,7 +440,6 @@ def regenerate_clip(clip_id: str, *, window: float = 120.0, use_llm: bool = True
     window_start = max(0.0, start - window / 2)
     window_end = end + window / 2
     subset = [sentence for sentence in sentences if sentence.end > window_start and sentence.start < window_end]
-    offset_index = sentences.index(subset[0]) if subset else 0
     for position, sentence in enumerate(subset):
         sentence.index = position
     blocks = build_blocks(subset)
@@ -418,16 +488,16 @@ def regenerate_clip(clip_id: str, *, window: float = 120.0, use_llm: bool = True
             status_code=422,
         )
 
-    # Absolute timings for the winning candidate.
-    absolute_start = best.start + window_start
-    absolute_end = best.end + window_start
+    # Sentences keep their source timestamps, so candidates are already absolute.
+    absolute_start = best.start
+    absolute_end = best.end
     words = words_in_range(sentences, absolute_start, absolute_end)
 
     enrichment: dict[str, Any] = {}
     if use_llm and settings.llm_enabled and not llm_note:
         try:
             enrichment = enrich_candidate(
-                transcript=" ".join(sentence.text for sentence in subset[:0]) or index.range_text(best.start_index, best.end_index),
+                transcript=index.range_text(best.start_index, best.end_index),
                 context_before=index.range_text(max(0, best.start_index - 2), best.start_index),
                 duration=best.duration,
                 language="",
@@ -438,9 +508,12 @@ def regenerate_clip(clip_id: str, *, window: float = 120.0, use_llm: bool = True
 
     changed = abs(absolute_start - start) > 0.75 or abs(absolute_end - current_end) > 0.75
     with session_scope() as session:
+        project = session.get(Project, project_id)
+        source = find_media(ProjectPaths.for_project(project).source) if project else None
+    timeline = plan_timeline(source, absolute_start, absolute_end, settings)
+    with session_scope() as session:
         clip = session.get(Clip, clip_id)
         clip.start, clip.end = absolute_start, absolute_end
-        clip.duration = round(absolute_end - absolute_start, 3)
         clip.score = best.score
         clip.title = (enrichment.get("title") or best.title or clip.title)[:300]
         clip.hook = (enrichment.get("hook") or best.hook or clip.hook)[:400]
@@ -449,7 +522,8 @@ def regenerate_clip(clip_id: str, *, window: float = 120.0, use_llm: bool = True
         clip.why_json = json.dumps(enrichment.get("why") or best.why or clip.why)
         clip.factors_json = json.dumps(best.features.factors)
         clip.words_json = json.dumps([word.to_dict() for word in words])
-        clip.trim_json = json.dumps(build_timeline(absolute_start, absolute_end, [], settings=settings).to_dict())
+        clip.trim_json = json.dumps(timeline.to_dict())
+        clip.duration = round(timeline.output_duration, 3)
         clip.status = "pending"
         clip.stage = "regenerated"
         clip.progress = 0.0
@@ -474,30 +548,63 @@ def regenerate_clip(clip_id: str, *, window: float = 120.0, use_llm: bool = True
 # --------------------------------------------------------------------------- #
 
 
-def caption_preview(clip_id: str, *, preset: str | None = None, theme: dict[str, Any] | None = None) -> dict[str, Any]:
-    with session_scope() as session:
-        clip = session.get(Clip, clip_id)
-        if clip is None:
-            raise not_found("Clip", clip_id)
-        project = session.get(Project, clip.project_id)
-        settings = project_settings_for(project) if project else get_settings()
-        words = [
-            Word(
-                word=item.get("word", ""),
-                start=float(item.get("start", 0)),
-                end=float(item.get("end", 0)),
-                confidence=float(item.get("confidence", 0)),
-                speaker=item.get("speaker", ""),
-            )
-            for item in json.loads(clip.words_json or "[]")
-            if item.get("word")
-        ]
-        language = project.language if project else "en"
+SAMPLE_CAPTION_TEXT = (
+    "This is how your captions will look on every clip you render, "
+    "with the key words highlighted exactly when they are spoken."
+)
+
+
+def _sample_words() -> list[Word]:
+    words: list[Word] = []
+    cursor = 0.2
+    for token in SAMPLE_CAPTION_TEXT.split():
+        length = 0.18 + 0.035 * len(token)
+        words.append(Word(word=token, start=round(cursor, 3), end=round(cursor + length, 3), confidence=0.95))
+        cursor += length + 0.06
+    return words
+
+
+def caption_preview(clip_id: str = "", *, preset: str | None = None, theme: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Caption lines for a clip (or sample text when ``clip_id`` is empty) in a given style."""
+    if preset and preset not in CAPTION_PRESETS:
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message=f"Unknown caption style '{preset}'.",
+            hint="Choose one of: " + ", ".join(sorted(CAPTION_PRESETS)),
+            status_code=422,
+        )
+    if clip_id:
+        with session_scope() as session:
+            clip = session.get(Clip, clip_id)
+            if clip is None:
+                raise not_found("Clip", clip_id)
+            project = session.get(Project, clip.project_id)
+            settings = project_settings_for(project) if project else get_settings()
+            words = [
+                Word(
+                    word=item.get("word", ""),
+                    start=float(item.get("start", 0)),
+                    end=float(item.get("end", 0)),
+                    confidence=float(item.get("confidence", 0)),
+                    speaker=item.get("speaker", ""),
+                )
+                for item in json.loads(clip.words_json or "[]")
+                if item.get("word")
+            ]
+            if words:  # clip words are source-timed; previews start at zero
+                offset = words[0].start
+                for word in words:
+                    word.start, word.end = word.start - offset, word.end - offset
+            language = project.language if project else "en"
+    else:
+        settings = get_settings()
+        words = _sample_words()
+        language = "en"
 
     base = settings.caption
     if preset:
         base = preset_theme(preset, base)
-    else:
+    elif clip_id:
         # No explicit preset: fall back to the style stored on this clip.
         stored = _stored_layout(clip_id).get("caption")
         if isinstance(stored, dict) and stored:
@@ -507,7 +614,7 @@ def caption_preview(clip_id: str, *, preset: str | None = None, theme: dict[str,
         merged.update({key: value for key, value in theme.items() if key in merged})
         try:
             base = CaptionTheme.model_validate(merged)
-        except Exception as exc:  # noqa: BLE001
+        except ValueError as exc:
             raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message=f"Invalid caption theme: {exc}", status_code=422) from exc
     plan = plan_captions(words, theme=base, language=language or "en")
     return {**plan.to_dict(), "theme": base.model_dump(), "captions_enabled": settings.captions_enabled}
@@ -558,7 +665,7 @@ def render_spec_preview(clip_id: str, *, quality: str = "final") -> str:
             raise not_found("Project", clip.project_id)
         settings = project_settings_for(project)
         paths = ProjectPaths.for_project(project)
-        layout = rebuild_layout(clip, settings)
+        snapshot = project.to_dict()
     source = find_media(paths.source)
     if source is None:
         raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Source media missing.", status_code=404)
@@ -570,7 +677,7 @@ def render_spec_preview(clip_id: str, *, quality: str = "final") -> str:
         paths=paths,
         settings=settings,
         quality=quality,
-        project_snapshot=project.to_dict() if project else {},
+        project_snapshot=snapshot,
     )
     return command_preview(spec)
 
@@ -590,6 +697,7 @@ __all__ = [
     "clip_assets_options",
     "clip_detail",
     "delete_clip",
+    "duplicate_clip",
     "get_clip",
     "load_project_sentences",
     "regenerate_clip",

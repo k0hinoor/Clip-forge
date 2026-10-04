@@ -7,8 +7,11 @@ Four rotating files under ``logs/``:
 * ``render.log``  - every ffmpeg/yt-dlp command and its output tail
 * ``ai.log``      - transcription and LLM interaction
 
-Console output stays compact and colourised; files get JSON lines so the
-Diagnostics page can parse them and show recent errors without grepping.
+Every record lands in exactly one file, chosen by its logger name
+(``clipforge.worker*``, ``clipforge.render*``, ``clipforge.ai*``; everything
+else goes to ``app.log``). Console output stays compact and colourised; files get
+JSON lines so the Diagnostics page can parse them and show recent errors without
+grepping.
 """
 
 from __future__ import annotations
@@ -76,6 +79,33 @@ class ConsoleFormatter(logging.Formatter):
         return message
 
 
+# Logger subtrees that own a dedicated file; everything else goes to app.log.
+_SUBSYSTEM_LOGGERS = {
+    "worker": "clipforge.worker",
+    "render": "clipforge.render",
+    "ai": "clipforge.ai",
+}
+
+
+def log_file_for(logger_name: str) -> str:
+    """Which of :data:`LOG_FILES` a logger writes to."""
+    for file_name, prefix in _SUBSYSTEM_LOGGERS.items():
+        if logger_name == prefix or logger_name.startswith(prefix + "."):
+            return file_name
+    return "app"
+
+
+class LogFileFilter(logging.Filter):
+    """Routes each record to exactly one log file (no duplicated lines)."""
+
+    def __init__(self, file_name: str) -> None:
+        super().__init__()
+        self.file_name = file_name
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        return log_file_for(record.name) == self.file_name
+
+
 class ContextAdapter(logging.LoggerAdapter):
     """Logger that stamps job/project/clip ids onto every record."""
 
@@ -112,6 +142,7 @@ def configure_logging(*, level: str | None = None, force: bool = False) -> None:
         )
         handler.setFormatter(JsonFormatter())
         handler.setLevel(logging.DEBUG)
+        handler.addFilter(LogFileFilter(name))
         root.addHandler(handler)
 
     # Quiet down noisy third party libraries on the console; keep the errors.
@@ -121,21 +152,14 @@ def configure_logging(*, level: str | None = None, force: bool = False) -> None:
     _CONFIGURED = True
 
 
-_LOG_MAP = {
-    "render": "clipforge.render",
-    "ai": "clipforge.ai",
-    "worker": "clipforge.worker",
-}
-
-
 def get_logger(name: str, **context: Any) -> logging.LoggerAdapter:
-    """Return a contextualised logger. ``get_logger(__name__, job_id=...)``."""
+    """Return a contextualised logger. ``get_logger(__name__, job_id=...)``.
+
+    Names outside the ``clipforge`` tree are moved into it so they share the
+    configured handlers; :func:`log_file_for` decides which file they land in.
+    """
     configure_logging()
-    if name.startswith("clipforge."):
-        suffix = name[len("clipforge."):].split(".")[0]
-        if suffix in _LOG_MAP and "." not in name[len("clipforge."):]:
-            name = f"{name}.{suffix}"
-    elif not name.startswith("clipforge"):
+    if name != "clipforge" and not name.startswith("clipforge."):
         name = f"clipforge.{name}"
     return ContextAdapter(logging.getLogger(name), context)
 
@@ -157,18 +181,29 @@ def tail_log(name: str, lines: int = 200, *, level: str | None = None) -> list[s
 
 
 def recent_errors(limit: int = 40) -> list[dict[str, Any]]:
-    """Structured recent errors across all logs, newest first."""
+    """Structured recent errors across all logs, newest first.
+
+    Identical records (same time, logger and message) are reported once, so logs
+    written by older versions - which copied every line into all four files - do
+    not show each error four times.
+    """
     found: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for name in LOG_FILES:
         for line in tail_log(name, lines=2000):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("level") in {"ERROR", "CRITICAL"}:
-                record["file"] = f"{name}.log"
-                found.append(record)
-    found.sort(key=lambda item: item.get("ts", ""), reverse=True)
+            if not isinstance(record, dict) or record.get("level") not in {"ERROR", "CRITICAL"}:
+                continue
+            key = (str(record.get("ts", "")), str(record.get("logger", "")), str(record.get("msg", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            record["file"] = f"{name}.log"
+            found.append(record)
+    found.sort(key=lambda item: str(item.get("ts", "")), reverse=True)
     return found[:limit]
 
 

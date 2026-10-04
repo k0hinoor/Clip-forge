@@ -60,6 +60,7 @@ class CommandCancelled(ClipForgeError):
 # --------------------------------------------------------------------------- #
 
 _running: dict[str, subprocess.Popen] = {}
+_cancelled_pids: set[int] = set()
 _registry_lock = threading.Lock()
 
 
@@ -74,20 +75,37 @@ def unregister_process(key: str) -> None:
 
 
 def kill_process(key: str) -> bool:
-    """Terminate the process tree registered under ``key``."""
+    """Terminate the process tree registered under ``key`` (a no-op for unknown keys).
+
+    The process is remembered as *cancelled* so :func:`run_command` reports a
+    cancellation rather than an encoder failure when it exits non-zero.
+    """
+    if not key:
+        return False
     with _registry_lock:
         process = _running.get(key)
-    if process is None or process.poll() is not None:
-        return False
+        if process is None or process.poll() is not None:
+            return False
+        _cancelled_pids.add(process.pid)
     _terminate(process)
     return True
 
 
 def kill_all() -> None:
+    """Terminate every registered process (used on shutdown)."""
     with _registry_lock:
-        processes = list(_running.values())
+        processes = [process for process in _running.values() if process.poll() is None]
+        _cancelled_pids.update(process.pid for process in processes)
     for process in processes:
         _terminate(process)
+
+
+def _was_cancelled(process: subprocess.Popen) -> bool:
+    with _registry_lock:
+        if process.pid in _cancelled_pids:
+            _cancelled_pids.discard(process.pid)
+            return True
+    return False
 
 
 def _terminate(process: subprocess.Popen) -> None:
@@ -233,7 +251,6 @@ def run_command(
 
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
-    cancelled = False
 
     def pump_stdout() -> None:
         assert process.stdout is not None
@@ -263,7 +280,6 @@ def run_command(
                 break
             if deadline and time.time() > deadline:
                 _terminate(process)
-                cancelled = True
                 raise ClipForgeError(
                     code=error_code,
                     message=f"{label} timed out after {int(timeout)}s.",
@@ -286,6 +302,9 @@ def run_command(
         command=list(argv),
     )
 
+    if _was_cancelled(process) and result.returncode != 0:
+        logger.info("%s cancelled after %.1fs", label, duration)
+        raise CommandCancelled(f"{label} was cancelled.")
     if result.returncode != 0:
         tail = result.stderr_tail or result.stdout[-2000:]
         from ..logging_setup import get_logger as _get

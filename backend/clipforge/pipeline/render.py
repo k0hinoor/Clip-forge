@@ -8,20 +8,22 @@ path as the first render.
 
 from __future__ import annotations
 
-import json
+import os
 import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ..config import AppSettings, get_settings
+from pydantic import ValidationError
+
+from ..config import AppSettings, Env, describe_validation_error, get_settings, merge_settings_patch
 from ..db import Clip, Project, session_scope, utcnow
 from ..errors import ClipForgeError, ErrorCode
 from ..logging_setup import get_logger
 from ..media.compose import RenderSpec, ZoomPoint, estimate_render_seconds, graph_summary, render as compose_render
 from ..media.ffmpeg import make_thumbnail, probe_media
 from ..media.framing import crop_plan_from_dict
-from ..system import ensure_disk_space, ffmpeg_info
+from ..system import ensure_disk_space, ffmpeg_info, open_in_file_manager
 from .context import ProgressReporter, ProjectPaths, find_media
 from .edit import clip_settings, layout_payload, rebuild_captions, rebuild_layout, resolve_asset
 
@@ -29,14 +31,20 @@ log = get_logger("clipforge.render")
 
 
 def project_settings_for(project: Project, overrides: dict[str, Any] | None = None) -> AppSettings:
-    snapshot = project.to_dict()
+    """Project settings, plus one-off render ``overrides`` (unknown keys ignored)."""
     from .analyze import project_settings_from_snapshot
 
-    settings = project_settings_from_snapshot(snapshot)
+    settings = project_settings_from_snapshot({"settings": project.settings})
     if overrides:
-        merged = {**settings.model_dump(), **{key: value for key, value in overrides.items() if key in settings.model_dump()}}
-        merged.update({key: value for key, value in overrides.items() if key == "caption"})
-        settings = AppSettings.model_validate(merged)
+        usable = {key: value for key, value in overrides.items() if key in AppSettings.model_fields}
+        try:
+            settings = AppSettings.model_validate(merge_settings_patch(settings.model_dump(), usable))
+        except ValidationError as exc:
+            raise ClipForgeError(
+                code=ErrorCode.INVALID_INPUT,
+                message=f"Invalid render override - {describe_validation_error(exc)}",
+                status_code=422,
+            ) from exc
     return settings
 
 
@@ -77,6 +85,7 @@ def render_clip(
         settings = project_settings_for(project, overrides)
         project_snapshot = project.to_dict()
         clip_status = clip.status
+        previous_file = clip.file_path or ""
         paths = ProjectPaths.for_project(project).ensure()
 
     if clip_status == "rendering":
@@ -99,14 +108,11 @@ def render_clip(
     if quality == "final":
         ensure_disk_space(1.5)
 
-    _update_clip(
-        clip_id,
-        status="rendering" if quality == "final" else clip_status,
-        progress=0.0,
-        stage="preparing",
-        error_code="",
-        error_message="",
-    )
+    if quality == "final":
+        _update_clip(clip_id, status="rendering", progress=0.0, stage="preparing", error_code="", error_message="")
+    else:
+        # A preview reports through its job; the clip keeps its own state.
+        _update_clip(clip_id, error_code="", error_message="")
     report.stage("prepare", "rebuilding the edit plan", fraction=0.05)
 
     try:
@@ -127,30 +133,61 @@ def render_clip(
         report.log(line)
     report.stage("render", "encoding", fraction=0.1)
 
+    if cancel_key:
+        spec.cancel_key = cancel_key
+
     def on_progress(fraction: float, message: str) -> None:
         if should_cancel and should_cancel():
             from ..media.runner import kill_process
 
-            kill_process(cancel_key or clip_id)
+            # The encoder is registered under the spec's key; killing anything
+            # else would leave it running.
+            kill_process(spec.cancel_key)
         report.sub(max(0.0, min(1.0, fraction)), message)
-        _update_clip(clip_id, progress=round(fraction, 3), stage=message[:40])
+        if quality == "final":
+            _update_clip(clip_id, progress=round(fraction, 3), stage=message[:40])
 
+    # Encode into a sibling ".part" file and swap it in only on success, so a
+    # failed or cancelled re-render never destroys the clip's previous file.
+    final_output = spec.output_path
+    spec.output_path = final_output.with_name(f"{final_output.stem}.part{final_output.suffix}")
     try:
         stats = compose_render(spec, progress=on_progress)
+        os.replace(spec.output_path, final_output)
     except ClipForgeError as exc:
-        _fail_clip(clip_id, exc, quality)
-        if exc.code == ErrorCode.RENDER_CANCELLED:
+        spec.output_path.unlink(missing_ok=True)
+        if exc.code in {ErrorCode.RENDER_CANCELLED, ErrorCode.CANCELLED}:
+            # The job layer restores the clip (previous file or pending).
             raise ClipForgeError(code=ErrorCode.CANCELLED, message="Render cancelled.", status_code=409) from exc
+        _fail_clip(clip_id, exc, quality)
         raise
+    except OSError as exc:
+        spec.output_path.unlink(missing_ok=True)
+        error = ClipForgeError(
+            code=ErrorCode.RENDER_FAILED,
+            message="The rendered clip could not be saved.",
+            hint="Check that the data folder is writable and has free space.",
+            detail=str(exc),
+            status_code=500,
+        )
+        _fail_clip(clip_id, error, quality)
+        raise error from exc
+    spec.output_path = final_output
+    stats["output"] = str(final_output)
 
     # --------------------------------------------------------------- finishing
-    report.stage("thumbnail", "generating a thumbnail", fraction=0.9)
     thumbnail = None
-    try:
-        thumb_dir = paths.renders / "thumbnails"
-        thumbnail = make_thumbnail(spec.output_path, thumb_dir / f"{clip_id}.jpg", time=min(1.5, stats["duration"] / 3), width=720)
-    except Exception as exc:  # noqa: BLE001 - thumbnail is cosmetic
-        log.debug("thumbnail failed: %s", exc)
+    # A low-res preview only provides the thumbnail while there is no final render.
+    if quality == "final" or not previous_file:
+        report.stage("thumbnail", "generating a thumbnail", fraction=0.9)
+        try:
+            thumb_dir = paths.renders / "thumbnails"
+            thumbnail = make_thumbnail(spec.output_path, thumb_dir / f"{clip_id}.jpg", time=min(1.5, stats["duration"] / 3), width=720)
+        except Exception as exc:  # noqa: BLE001 - thumbnail is cosmetic
+            log.debug("thumbnail failed: %s", exc)
+
+    if quality == "final":
+        _remove_replaced_render(previous_file, spec.output_path, paths)
 
     exported: Path | None = None
     if export and quality == "final":
@@ -160,22 +197,31 @@ def render_clip(
         except OSError as exc:
             log.warning("export copy failed: %s", exc)
             report.log("Could not copy the clip to the export folder (see logs/app.log).")
+        if exported is not None and settings.auto_open_folder and Env.local_paths_allowed():
+            try:
+                open_in_file_manager(exported.parent)
+            except ClipForgeError as exc:
+                report.log(f"{exc.message} {exc.hint}".strip())
 
-    fields: dict[str, Any] = {
-        "progress": 1.0,
-        "stage": "rendered",
-        "render_seconds": round(time.time() - started, 2),
-        "file_size": stats["size_bytes"],
-        "width": stats["width"],
-        "height": stats["height"],
-        "fps": int(round(stats["fps"] or spec.fps)),
-        "subtitle_path": str(spec.subtitle_path) if spec.subtitle_path else "",
-        "srt_path": str(spec.srt_path) if spec.srt_path else "",
-        "error_code": "",
-        "error_message": "",
-    }
+    fields: dict[str, Any] = {"error_code": "", "error_message": ""}
     if quality == "final":
-        fields.update({"status": "rendered", "file_path": str(spec.output_path), "rendered_at": utcnow()})
+        # Size, dimensions and timings describe the deliverable - a preview
+        # (480p) must never overwrite them.
+        fields.update(
+            {
+                "status": "rendered",
+                "stage": "rendered",
+                "progress": 1.0,
+                "render_seconds": round(time.time() - started, 2),
+                "file_size": stats["size_bytes"],
+                "width": stats["width"],
+                "height": stats["height"],
+                "file_path": str(spec.output_path),
+                "rendered_at": utcnow(),
+                "fps": int(round(stats["fps"] or spec.fps)),
+                "subtitle_path": str(spec.subtitle_path) if spec.subtitle_path else "",
+            }
+        )
     else:
         fields.update({"preview_path": str(spec.output_path)})
     if thumbnail is not None:
@@ -227,24 +273,30 @@ def _build_spec_from_db(
         # in the stored plan and must reach the encoder.
         settings = clip_settings(settings, layout_settings)
         timeline = _load_timeline(clip, settings)
+        # Punch-ins stay in the plan; "Automatic punch-ins" decides whether they render.
         zoom_points = [
             ZoomPoint(time=float(point.get("time", 0)), strength=float(point.get("strength", 1.0)), reason=str(point.get("reason", "")))
-            for point in plan.get("zoom_points") or []
-        ]
+            for point in (plan.get("zoom_points") or layout_settings.get("zoom_points") or [])
+        ] if settings.auto_zoom else []
         captions = rebuild_captions(clip, settings, plan.get("language", settings.language_hint or "en"), [p.time for p in zoom_points])
         crop_plan = crop_plan_from_dict(plan.get("crop"))
         layout = str(layout_settings.get("layout") or settings.layout)
         split_ratio = int(layout_settings.get("split_ratio") or settings.split_ratio)
+        notes = list(layout_settings.get("notes") or [])
         gameplay = resolve_asset(layout_settings.get("gameplay"))
+        if layout in {"split", "gameplay"} and not settings.gameplay_enabled:
+            layout, gameplay = "podcast", None
+            notes.append("Gameplay is switched off for this clip, so the speaker fills the frame.")
         broll = resolve_asset(layout_settings.get("broll"))
         music = resolve_asset(layout_settings.get("music"))
         title = clip.title
         index = clip.index
+        previous_file = clip.file_path or ""
 
     source_fps = float(getattr(probe_media(source_path), "fps", 0.0) or 0.0)
 
     width, height = settings.aspect_dims()
-    fps = settings.output_fps
+    fps = settings.output_fps if settings.allow_60fps else min(settings.output_fps, 30)
     if quality == "preview":
         width, height = _preview_dims(width, height)
         fps = min(fps, 30)
@@ -253,8 +305,13 @@ def _build_spec_from_db(
         folder = paths.renders / "previews"
         output = folder / f"{clip_id}_preview.mp4"
     else:
-        output = paths.render_path(index, title or f"clip_{index:02d}")
-    subtitle_path = paths.clip_dir(index) / "captions.ass"
+        output = paths.render_path(
+            index,
+            title or f"clip_{index:02d}",
+            project_title=str(project_snapshot.get("title") or ""),
+            reuse=previous_file,
+        )
+    subtitle_path = paths.clip_dir(index) / ("preview.ass" if quality == "preview" else "captions.ass")
 
     return RenderSpec(
         source_path=source_path,
@@ -278,7 +335,7 @@ def _build_spec_from_db(
         settings=settings,
         quality=quality,
         cancel_key=clip_id,
-        notes=list(layout_settings.get("notes") or []),
+        notes=notes,
     )
 
 
@@ -314,13 +371,29 @@ def _update_clip(clip_id: str, **fields: Any) -> None:
 
 
 def _fail_clip(clip_id: str, error: ClipForgeError, quality: str) -> None:
-    fields: dict[str, Any] = {
-        "status": "failed" if quality == "final" else "pending",
-        "stage": "failed",
-        "error_code": error.code,
-        "error_message": error.message,
-    }
-    _update_clip(clip_id, **fields)
+    """Record a render failure. A failed *preview* never changes the clip's status."""
+    if quality == "final":
+        _update_clip(clip_id, status="failed", stage="failed", error_code=error.code, error_message=error.message)
+    else:
+        _update_clip(clip_id, error_code=error.code, error_message=f"Preview failed: {error.message}")
+
+
+def _remove_replaced_render(previous: str, current: Path, paths: ProjectPaths) -> None:
+    """Delete the clip's old render once a new one (e.g. after a rename) replaced it."""
+    if not previous:
+        return
+    old = Path(previous)
+    try:
+        if old.resolve() == current.resolve() or not old.is_file():
+            return
+        old.resolve().relative_to(paths.renders.resolve())  # only ever inside renders/
+    except (OSError, ValueError):
+        return
+    try:
+        old.unlink()
+        log.info("removed replaced render %s", old.name)
+    except OSError as exc:
+        log.warning("could not remove the replaced render %s: %s", old, exc)
 
 
 def render_queue_estimate(clip_ids: list[str], settings: AppSettings | None = None) -> dict[str, Any]:

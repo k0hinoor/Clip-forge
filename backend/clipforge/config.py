@@ -22,7 +22,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .errors import invalid_input
 
@@ -44,6 +44,17 @@ def _default_data_dir() -> Path:
     if env:
         return Path(env).expanduser().resolve()
     return (REPO_ROOT / "data").resolve()
+
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """Boolean environment variable (``1/true/yes/on`` vs ``0/false/no/off``)."""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
 
 
 class Env:
@@ -68,6 +79,18 @@ class Env:
     @classmethod
     def relative_paths(cls) -> dict[str, Path]:
         return {"data_dir": cls.DATA_DIR, "db_path": cls.DB_PATH, "log_dir": cls.LOG_DIR}
+
+    @classmethod
+    def local_paths_allowed(cls) -> bool:
+        """Whether API callers may point the server at its own filesystem/desktop.
+
+        Importing a server-side path, opening a folder in the file manager and
+        similar conveniences only make sense when the browser and the backend
+        share a machine. They default to *on* for a loopback host (the desktop
+        app) and *off* when the API listens publicly; set
+        ``CLIPFORGE_ALLOW_LOCAL_PATHS`` to override either way.
+        """
+        return env_flag("CLIPFORGE_ALLOW_LOCAL_PATHS", cls.HOST in LOOPBACK_HOSTS)
 
 
 def ensure_dirs() -> None:
@@ -274,6 +297,18 @@ class AppSettings(BaseModel):
             raise ValueError("must be one of 24, 25, 30, 50, 60")
         return value
 
+    @field_validator("export_filename_template")
+    @classmethod
+    def _filename_template(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            return "{project_slug}_{index:02d}_{title_slug}"
+        try:
+            value.format(project_slug="project", index=1, title_slug="title")
+        except (KeyError, IndexError, ValueError, AttributeError) as exc:
+            raise ValueError("use only the {project_slug}, {index} (e.g. {index:02d}) and {title_slug} placeholders") from exc
+        return value
+
     @model_validator(mode="after")
     def _sync_size_to_ratio(self) -> "AppSettings":
         """Keep the pixel size on the chosen aspect ratio.
@@ -373,6 +408,73 @@ SECTION_FIELDS: dict[str, tuple[str, ...]] = {
 
 SECRET_FREE = True  # nothing in AppSettings is sensitive; safe to echo to the UI
 
+# Settings that point at the server's own filesystem or binaries. They can only
+# be changed when local-path features are allowed (see Env.local_paths_allowed):
+# on a public deployment they would let any visitor write files anywhere or swap
+# the ffmpeg binary.
+SERVER_PATH_FIELDS: tuple[str, ...] = ("export_dir", "ffmpeg_path", "ffprobe_path", "cookies_path", "whisper_cache_dir")
+
+
+def merge_settings_patch(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Apply a partial settings patch to a settings dict.
+
+    Top-level keys replace their old value, but the nested ``caption`` theme is
+    *merged*: sending ``{"caption": {"font_size": 70}}`` changes the size and keeps
+    every other caption choice. When the patch names a caption ``preset``, that
+    preset's look is applied first and any explicit caption keys in the same
+    patch win - so templates and per-project options can be partial.
+    """
+    merged = {**current, **{key: value for key, value in patch.items() if key != "caption"}}
+    if "caption" not in patch:
+        return merged
+    caption_patch = patch["caption"]
+    if not isinstance(caption_patch, dict):
+        merged["caption"] = caption_patch  # validation reports the bad type
+        return merged
+    caption = dict(current.get("caption") or {})
+    preset = caption_patch.get("preset")
+    if preset:
+        from .constants import CAPTION_PRESETS  # local: constants is a leaf module
+
+        definition = CAPTION_PRESETS.get(str(preset))
+        if definition:
+            caption.update(dict(definition.get("theme") or {}))
+    caption.update(caption_patch)
+    merged["caption"] = caption
+    return merged
+
+
+def describe_validation_error(exc: ValidationError, limit: int = 4) -> str:
+    """``field: problem`` pairs instead of pydantic's multi-line dump."""
+    parts = []
+    for error in exc.errors()[:limit]:
+        location = ".".join(str(part) for part in error.get("loc", ()) if part != "__root__") or "settings"
+        message = str(error.get("msg", "invalid value")).removeprefix("Value error, ")
+        parts.append(f"{location}: {message}")
+    return "; ".join(parts) or "invalid value"
+
+
+def load_settings_leniently(raw: dict[str, Any]) -> AppSettings:
+    """Validate stored settings, dropping only the entries that no longer fit.
+
+    Settings saved by another version may contain renamed or out-of-range
+    fields. Rather than silently resetting *everything* to defaults, unknown
+    keys are ignored and invalid values fall back to their default one by one.
+    """
+    defaults = AppSettings().model_dump()
+    known = {key: value for key, value in raw.items() if key in AppSettings.model_fields}
+    candidate = merge_settings_patch(defaults, known)
+    for _attempt in range(len(known) + 1):
+        try:
+            return AppSettings.model_validate(candidate)
+        except ValidationError as exc:
+            broken = {str(error["loc"][0]) for error in exc.errors() if error.get("loc")}
+            if not broken or not broken & set(candidate):
+                break
+            for key in broken:
+                candidate[key] = defaults.get(key)
+    return AppSettings()
+
 
 class SettingsStore:
     """Thread-safe settings holder with SQLite persistence and change listeners."""
@@ -394,14 +496,21 @@ class SettingsStore:
 
     # ---------------------------------------------------------- mutation
     def update(self, patch: dict[str, Any]) -> AppSettings:
+        """Apply a partial update (unknown keys are rejected, ``caption`` is merged)."""
         if not isinstance(patch, dict):
             raise invalid_input("Settings payload must be a JSON object.")
-        merged = {**self._settings.model_dump(), **patch}
-        try:
-            new_settings = AppSettings.model_validate(merged)
-        except Exception as exc:  # pydantic ValidationError -> friendly message
-            raise invalid_input(f"Invalid setting: {exc}", "Check the value ranges in Settings.") from exc
+        unknown = sorted(key for key in patch if key not in AppSettings.model_fields)
+        if unknown:
+            raise invalid_input(
+                f"Unknown setting{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}.",
+                "GET /api/settings/schema lists every setting this version understands.",
+            )
         with self._lock:
+            merged = merge_settings_patch(self._settings.model_dump(), patch)
+            try:
+                new_settings = AppSettings.model_validate(merged)
+            except ValidationError as exc:
+                raise invalid_input(f"Invalid setting - {describe_validation_error(exc)}", "Check the value ranges in Settings.") from exc
             self._settings = new_settings
             listeners = list(self._listeners)
         self.persist()
@@ -426,11 +535,9 @@ class SettingsStore:
 
         raw = kv_get("settings")
         if isinstance(raw, dict):
-            try:
-                with self._lock:
-                    self._settings = AppSettings.model_validate({**AppSettings().model_dump(), **raw})
-            except Exception:
-                pass  # ignore corrupt overrides, keep defaults
+            loaded = load_settings_leniently(raw)
+            with self._lock:
+                self._settings = loaded
         return self._settings
 
     # ------------------------------------------------------------ helpers
