@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Clapperboard,
   FileAudio,
   Gauge,
@@ -111,7 +112,8 @@ export default function StudioPage() {
   };
 
   const hardware = status?.hardware;
-  const recommendation = (status as any)?.recommendation;
+  const recommendation = status?.hardware?.recommended;
+  const notices = status?.notes ?? [];
 
   return (
     <div className="space-y-8">
@@ -127,7 +129,7 @@ export default function StudioPage() {
           {hardware ? (
             <div className="chip">
               <Gauge size={13} />
-              {hardware.cpu?.split(" ").slice(0, 3).join(" ") || "CPU"} · {hardware.ram_gb} GB RAM
+              {hardware.cpu?.name?.split(" ").slice(0, 3).join(" ") || "CPU"} · {hardware.memory?.total_gb} GB RAM
               {hardware.gpu?.available ? ` · ${hardware.gpu.devices?.[0]?.name ?? hardware.gpu.vendor}` : " · CPU only"}
             </div>
           ) : null}
@@ -285,12 +287,27 @@ export default function StudioPage() {
         ) : null}
       </section>
 
-      {recommendation?.note ? (
+      {recommendation ? (
         <div className="card-tight flex flex-wrap items-center gap-2 p-3 text-xs text-mist-300">
           <Sparkles size={14} className="text-amber-glow" />
-          {recommendation.note}
+          Whisper {recommendation.whisper_model} on {recommendation.whisper_device}
+          {recommendation.hw_accel && recommendation.hw_accel !== "none" ? ` · ${recommendation.hw_accel} encode` : " · CPU encode"}
         </div>
       ) : null}
+
+      {notices.map((note, index) => (
+        <div
+          key={index}
+          className="card-tight flex flex-wrap items-center gap-2 p-3 text-xs text-mist-300"
+        >
+          <AlertTriangle
+            size={14}
+            className={note.level === "error" ? "text-flare-400" : note.level === "warning" ? "text-amber-glow" : "text-mist-400"}
+          />
+          <span className="font-semibold text-mist-200">{note.title}</span>
+          <span className="text-mist-400">{note.detail}</span>
+        </div>
+      ))}
 
       <section className="space-y-3">
         <div className="flex flex-wrap items-center gap-3">

@@ -280,7 +280,20 @@ class AppSettings(BaseModel):
         return Path(self.export_dir).expanduser().resolve() if self.export_dir else Env.DATA_DIR / "exports"
 
     def aspect_dims(self) -> tuple[int, int]:
-        return ASPECT_PRESETS[self.aspect_ratio]
+        """Output size: the custom width/height when they match the chosen aspect ratio.
+
+        ``aspect_ratio`` is the preset the user picks; ``output_width``/``output_height``
+        are the actual pixels (e.g. 540x960 for a fast draft). They are honoured only
+        when they agree with the ratio, so a stale size can never distort the frame.
+        """
+        preset_width, preset_height = ASPECT_PRESETS[self.aspect_ratio]
+        width = int(self.output_width or 0)
+        height = int(self.output_height or 0)
+        if width >= 240 and height >= 240:
+            target = preset_width / preset_height
+            if abs(width / height - target) <= 0.02:
+                return width - width % 2, height - height % 2
+        return preset_width, preset_height
 
     def clip_limits(self) -> tuple[float, float, float]:
         """Return ``(min, target, max)`` seconds with sane ordering enforced."""

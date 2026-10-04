@@ -254,21 +254,74 @@ export interface SettingsSchemaField {
   lt?: number;
 }
 
+export interface FfmpegInfo {
+  available: boolean;
+  ffmpeg: string;
+  ffprobe: string;
+  version: string;
+  source: string;
+  libass: boolean;
+  drawtext: boolean;
+  overlay: boolean;
+  libx264: boolean;
+  encoders: string[];
+  hwaccels: string[];
+  problems: string[];
+}
+
+export interface AiStack {
+  faster_whisper: boolean;
+  whisperx: boolean;
+  opencv: boolean;
+  torch: boolean;
+  torch_cuda: boolean;
+  faster_whisper_version: string;
+  transcription_available: boolean;
+}
+
+export interface GpuDevice {
+  name: string;
+  vendor?: string;
+  vram_total_mb?: number;
+  vram_free_mb?: number;
+  driver?: string;
+  compute?: string;
+}
+
+export interface HardwareInfo {
+  os: string;
+  os_version: string;
+  arch: string;
+  python: string;
+  cpu: { name: string; logical_cores: number; physical_cores: number; usage_percent: number };
+  memory: { total_gb: number; available_gb: number; used_percent: number };
+  gpu: { available: boolean; vendor: string; cuda: boolean; devices: GpuDevice[] };
+  disk: { total_gb?: number; free_gb?: number; used_percent?: number };
+  ffmpeg: FfmpegInfo;
+  ai: AiStack;
+  recommended: { whisper_device: string; whisper_model: string; hw_accel: string; concurrency: number };
+}
+
 export interface HardwareReport {
-  hardware: {
-    os: string;
-    arch: string;
-    cpu: string;
-    cores: number;
-    threads: number;
-    ram_gb: number;
-    ram_available_gb: number;
-    gpu: { available: boolean; vendor: string; cuda: boolean; devices: { name: string; vram_gb: number }[] };
-    disk: { total_gb: number; free_gb: number; used_percent: number };
-    ffmpeg: { available: boolean; ffmpeg: string; ffprobe: string; version: string; source: string; has_libass: boolean; encoders: string[]; problems: string[] };
-  };
-  ai: Record<string, any>;
-  recommendation: { whisper_model: string; device: string; compute_type: string; note: string };
+  hardware: HardwareInfo;
+  ai: AiStack;
+  ffmpeg: FfmpegInfo;
+}
+
+export interface SystemNote {
+  level: "info" | "warning" | "error" | string;
+  title: string;
+  detail: string;
+}
+
+export interface Diagnostics {
+  paths: { data_dir: string; database: string; logs: string; exports: string };
+  logs: { app: string; worker: string; render: string; ai: string };
+  ffmpeg: FfmpegInfo;
+  ai: AiStack;
+  errors: { at?: string; logger?: string; message?: string }[];
+  python: string;
+  platform: string;
 }
 
 export interface SystemStatus {
@@ -276,13 +329,12 @@ export interface SystemStatus {
   version: string;
   ready: boolean;
   data_dir: string;
-  exports_dir: string;
-  database: string;
-  problems: string[];
-  notes: string[];
-  ffmpeg: { available: boolean; version: string; has_libass: boolean };
-  ai: Record<string, any>;
-  llm: { enabled: boolean; available: boolean; model: string; models: string[]; error: string };
-  queue: QueueState;
-  worker: Record<string, any>;
+  ffmpeg: FfmpegInfo;
+  ai: AiStack;
+  hardware: HardwareInfo;
+  workers: { running: boolean; workers: number; worker_names: string[]; busy: string[]; uptime_seconds: number };
+  queue: { queued: number; running: number };
+  usage: { cpu_percent: number; memory_percent: number; process_memory_mb: number; process_cpu_percent: number };
+  notes: SystemNote[];
 }
+

@@ -368,13 +368,16 @@ def build_filter_graph(
         asset_height = 0
 
     if layout == "blur":
+        # Two chains read the same frames, so the pad has to be split explicitly:
+        # ffmpeg treats a label consumed twice as a stream specifier and refuses it.
+        graph.append(f"{video_label}split=2[vbg][vfg]")
         graph.append(
-            f"{video_label}scale={width}:{height}:force_original_aspect_ratio=increase:flags=bicubic,"
+            f"[vbg]scale={width}:{height}:force_original_aspect_ratio=increase:flags=bicubic,"
             f"crop={width}:{height},boxblur=luma_radius=40:luma_power=2:chroma_radius=16:chroma_power=2,"
             f"eq=brightness=-0.06:saturation=1.12[bg]"
         )
         graph.append(
-            f"{video_label}scale={int(width * 0.95)}:{int(height * 0.95)}:force_original_aspect_ratio=decrease:flags=lanczos[fg]"
+            f"[vfg]scale={int(width * 0.95)}:{int(height * 0.95)}:force_original_aspect_ratio=decrease:flags=lanczos[fg]"
         )
         graph.append("[bg][fg]overlay=(W-w)/2:(H-h)/2[vframed]")
         video_out = "[vframed]"

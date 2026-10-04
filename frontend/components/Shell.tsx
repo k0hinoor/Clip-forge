@@ -33,7 +33,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const queue = status?.queue?.counts;
+  const queue = status?.queue;
 
   return (
     <div className="flex min-h-screen">
@@ -55,8 +55,10 @@ export function Shell({ children }: { children: React.ReactNode }) {
               <Link key={item.href} href={item.href} className={`btn ${active ? "btn-ghost" : "btn-quiet"} justify-start`}>
                 <Icon size={16} />
                 {item.label}
-                {item.href === "/jobs" && queue && queue.total > 0 ? (
-                  <span className="ml-auto chip">{queue.running > 0 ? `${queue.running} running` : `${queue.total}`}</span>
+                {item.href === "/jobs" && queue && queue.queued + queue.running > 0 ? (
+                  <span className="ml-auto chip">
+                    {queue.running > 0 ? `${queue.running} running` : `${queue.queued} queued`}
+                  </span>
                 ) : null}
               </Link>
             );

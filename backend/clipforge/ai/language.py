@@ -114,6 +114,24 @@ def language_name(code: str) -> str:
     return LANGUAGE_NAMES.get(base, code.upper())
 
 
+SCRIPT_LANGUAGES = (
+    ("devanagari", "hi"),
+    ("arabic", "ar"),
+    ("cyrillic", "ru"),
+    ("cjk", "zh"),
+)
+
+
+def _language_for_script(counts: dict[str, int], letters: int) -> str:
+    """The language implied by a clearly dominant script (>= 50% of the letters)."""
+    if letters <= 1:
+        return ""
+    for script, language in SCRIPT_LANGUAGES:
+        if counts.get(script, 0) / letters >= 0.5:
+            return language
+    return ""
+
+
 def detect_language(
     text: str,
     *,
@@ -135,10 +153,18 @@ def detect_language(
         confidence=whisper_confidence,
     )
 
+    devanagari = counts["devanagari"]
+    latin = counts["latin"]
+    letters = max(devanagari + latin + counts["arabic"] + counts["cyrillic"] + counts["cjk"], 1)
+    script_language = _language_for_script(counts, letters)
+
     fingerprint = _fingerprint_language(tokens)
     primary = (whisper_language or "").split("-")[0].lower()
     if not primary:
-        primary = fingerprint[0] if fingerprint else "en"
+        # Script evidence outranks the Latin-word fingerprint: a Devanagari
+        # transcript has no Latin tokens at all, and defaulting it to English
+        # would caption Hindi audio as English.
+        primary = script_language or (fingerprint[0] if fingerprint else "en")
     if primary:
         # Whisper's guess is the starting point; the checks below can still
         # override it (romanised Hindi reported as English, mixed scripts, ...).
@@ -148,9 +174,9 @@ def detect_language(
     hinglish = hinglish_score(sample)
     profile.hinglish_score = round(hinglish, 3)
 
-    devanagari = counts["devanagari"]
-    latin = counts["latin"]
-    letters = max(devanagari + latin + counts["arabic"] + counts["cyrillic"] + counts["cjk"], 1)
+    if script_language and primary in {"", "en"} and primary != script_language and not whisper_language:
+        profile.primary = script_language
+        profile.notes.append(f"Script evidence points at {language_name(script_language)}.")
 
     if primary == "hi" and latin > devanagari:
         # Hindi reported but the transcript is mostly romanised.
@@ -175,7 +201,7 @@ def detect_language(
         profile.secondary_share = round(min(latin, devanagari) / letters, 3)
         profile.notes.append("Mixed-script transcript: the caption engine keeps both languages as spoken.")
 
-    if fingerprint and not whisper_language:
+    if fingerprint and not whisper_language and not script_language:
         profile.primary = fingerprint[0]
         profile.confidence = fingerprint[1]
 

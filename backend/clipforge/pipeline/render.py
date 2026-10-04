@@ -23,7 +23,7 @@ from ..media.ffmpeg import make_thumbnail, probe_media
 from ..media.framing import crop_plan_from_dict
 from ..system import ensure_disk_space, ffmpeg_info
 from .context import ProgressReporter, ProjectPaths, find_media
-from .edit import rebuild_captions, rebuild_layout, resolve_asset
+from .edit import layout_payload, rebuild_captions, rebuild_layout, resolve_asset
 
 log = get_logger("clipforge.render")
 
@@ -220,19 +220,20 @@ def _build_spec_from_db(
         clip = session.get(Clip, clip_id)
         if clip is None:
             raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Clip not found.", status_code=404)
-        layout_payload = rebuild_layout(clip, settings)
+        plan = rebuild_layout(clip, settings)
+        layout_settings = layout_payload(plan)
         timeline = _load_timeline(clip, settings)
         zoom_points = [
             ZoomPoint(time=float(point.get("time", 0)), strength=float(point.get("strength", 1.0)), reason=str(point.get("reason", "")))
-            for point in layout_payload.get("zoom_points") or []
+            for point in plan.get("zoom_points") or []
         ]
-        captions = rebuild_captions(clip, settings, layout_payload.get("language", settings.language_hint or "en"), [p.time for p in zoom_points])
-        crop_plan = crop_plan_from_dict(layout_payload.get("crop"))
-        layout = str(layout_payload.get("layout") or settings.layout)
-        split_ratio = int(layout_payload.get("split_ratio") or settings.split_ratio)
-        gameplay = resolve_asset(layout_payload.get("gameplay"))
-        broll = resolve_asset(layout_payload.get("broll"))
-        music = resolve_asset(layout_payload.get("music"))
+        captions = rebuild_captions(clip, settings, plan.get("language", settings.language_hint or "en"), [p.time for p in zoom_points])
+        crop_plan = crop_plan_from_dict(plan.get("crop"))
+        layout = str(layout_settings.get("layout") or settings.layout)
+        split_ratio = int(layout_settings.get("split_ratio") or settings.split_ratio)
+        gameplay = resolve_asset(layout_settings.get("gameplay"))
+        broll = resolve_asset(layout_settings.get("broll"))
+        music = resolve_asset(layout_settings.get("music"))
         title = clip.title
         index = clip.index
 
@@ -267,13 +268,13 @@ def _build_spec_from_db(
         music_path=music,
         zoom_points=zoom_points,
         source_fps=source_fps,
-        language=layout_payload.get("language", "en"),
+        language=plan.get("language", "en"),
         title=title,
         subtitle_path=subtitle_path,
         settings=settings,
         quality=quality,
         cancel_key=clip_id,
-        notes=list(layout_payload.get("notes") or []),
+        notes=list(layout_settings.get("notes") or []),
     )
 
 

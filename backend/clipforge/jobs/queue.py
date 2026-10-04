@@ -216,6 +216,7 @@ def list_jobs(
     statuses: Sequence[str] = (),
     limit: int = 100,
     include_finished: bool = True,
+    with_log: bool = False,
 ) -> list[dict[str, Any]]:
     with session_scope() as session:
         query = select(Job)
@@ -226,7 +227,7 @@ def list_jobs(
         elif not include_finished:
             query = query.where(Job.status.in_(("queued", "running")))
         rows = session.execute(query.order_by(Job.created_at.desc()).limit(limit)).scalars().all()
-        return [row.to_dict(with_log=False) for row in rows]
+        return [row.to_dict(with_log=with_log) for row in rows]
 
 
 def queue_state(project_id: str = "") -> dict[str, Any]:

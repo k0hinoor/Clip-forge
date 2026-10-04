@@ -336,6 +336,7 @@ def load_timeline(clip: Any, settings: AppSettings) -> Timeline:
                 for segment in payload["segments"]
             ],
             speed=float(payload.get("speed", 1.0)),
+            removed=[(float(pair[0]), float(pair[1])) for pair in payload.get("removed") or [] if len(pair) == 2],
             source_start=float(payload["segments"][0]["src_start"]),
             source_end=float(payload["segments"][-1]["src_end"]),
             source_duration=float(payload["segments"][-1]["src_end"]) - float(payload["segments"][0]["src_start"]),
@@ -360,10 +361,32 @@ def rebuild_captions(clip: Any, settings: AppSettings, language: str, zoom_times
 
 
 def rebuild_layout(clip: Any, settings: AppSettings) -> dict[str, Any]:
+    """The clip's stored plan (``ClipPlan.to_dict()`` shape)."""
     try:
         return json.loads(clip.layout_json or "{}")
     except json.JSONDecodeError:
         return {}
+
+
+def layout_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    """Layout settings inside a stored plan.
+
+    ``ClipPlan.to_dict()`` nests them under ``layout`` (layout, split_ratio,
+    gameplay, broll, music, notes); plans written by earlier versions kept them at
+    the top level, so both shapes are accepted here rather than in every caller.
+    """
+    inner = plan.get("layout")
+    return inner if isinstance(inner, dict) else plan
+
+
+def set_layout_payload(plan: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Write layout settings back into a plan, preserving the stored shape."""
+    inner = plan.get("layout")
+    if isinstance(inner, dict):
+        plan["layout"] = payload
+    else:
+        plan.update(payload)
+    return plan
 
 
 def resolve_asset(entry: dict[str, Any] | None) -> Path | None:
@@ -380,7 +403,8 @@ def resolve_asset(entry: dict[str, Any] | None) -> Path | None:
 
 def clip_plan_summary(clip: Any, settings: AppSettings) -> dict[str, Any]:
     """Plan overview for the clip detail panel (no heavy work)."""
-    layout = rebuild_layout(clip, settings)
+    plan = rebuild_layout(clip, settings)
+    layout = layout_payload(plan)
     timeline = load_timeline(clip, settings)
     return {
         "layout": layout.get("layout", settings.layout),
@@ -407,5 +431,7 @@ __all__ = [
     "plan_zoom_points",
     "rebuild_captions",
     "rebuild_layout",
+    "layout_payload",
+    "set_layout_payload",
     "resolve_asset",
 ]

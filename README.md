@@ -241,8 +241,10 @@ python -m pytest -q                          # unit + API tests (fast, offline)
 python -m pytest -q -m "not e2e"             # skip the full pipeline test
 ```
 
-The end-to-end test needs a real video. Generate one locally (about 7½ minutes of synthetic speech over
-a test pattern, including a scripted sponsor block the analyser must reject):
+The end-to-end test needs a real video. Generate one locally (about 5½ minutes, including a scripted
+sponsor block the analyser must reject). Narration is synthesised with espeak/mespeak when one is
+installed, and falls back to syllable-shaped tones when not - the audio still has real speech energy
+and real pauses, and the script text drives the analysis through its caption file):
 
 ```bash
 python tools/make_test_media.py --out /tmp/fix/source.mp4      # writes manifest.json next to it

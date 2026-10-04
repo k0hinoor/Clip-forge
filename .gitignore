@@ -18,6 +18,7 @@ node_modules/
 frontend/.next/
 frontend/out/
 frontend/next-env.d.ts
+*.tsbuildinfo
 npm-debug.log*
 yarn-error.log*
 

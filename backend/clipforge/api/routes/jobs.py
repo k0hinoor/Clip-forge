@@ -22,9 +22,10 @@ def list_jobs(
     project_id: str = Query(""),
     statuses: str = Query("", description="Comma separated"),
     limit: int = Query(100, ge=1, le=500),
+    with_log: bool = Query(False, description="Include the per-stage log of each job"),
 ):
     parsed = tuple(item for item in statuses.split(",") if item)
-    return {"jobs": job_queue.list_jobs(project_id=project_id, statuses=parsed, limit=limit)}
+    return {"jobs": job_queue.list_jobs(project_id=project_id, statuses=parsed, limit=limit, with_log=with_log)}
 
 
 @router.get("/jobs/queue")

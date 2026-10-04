@@ -5,7 +5,7 @@ import { Cpu, Gauge, HardDrive, RefreshCw, Save, Server, Terminal, Wand2 } from 
 import { api } from "@/lib/api";
 import { useToast } from "@/components/Toast";
 import { bytes } from "@/lib/format";
-import type { HardwareReport, SettingsSchemaField, SystemStatus } from "@/lib/types";
+import type { Diagnostics, HardwareReport, SettingsSchemaField, SystemStatus } from "@/lib/types";
 
 const SECTION_LABELS: Record<string, string> = {
   general: "General",
@@ -28,23 +28,28 @@ export default function SettingsPage() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [templates, setTemplates] = useState<any[]>([]);
   const [ollama, setOllama] = useState<{ models: string[]; error?: string }>({ models: [] });
+  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [busy, setBusy] = useState(false);
   const [activeSection, setActiveSection] = useState("video");
 
   const load = useCallback(async () => {
     try {
-      const [schemaPayload, settingsPayload, hardwarePayload, statusPayload, templatePayload] = await Promise.all([
-        api.settingsSchema(),
-        api.settings(),
-        api.hardware(),
-        api.status(),
-        api.templates(),
-      ]);
+      const [schemaPayload, settingsPayload, hardwarePayload, statusPayload, templatePayload, diagnosticsPayload] =
+        await Promise.all([
+          api.settingsSchema(),
+          api.settings(),
+          api.hardware(),
+          api.status(),
+          api.templates(),
+          api.diagnostics(),
+        ]);
       setSchema(schemaPayload.schema);
       setValues(settingsPayload.settings);
       setHardware(hardwarePayload);
       setStatus(statusPayload);
       setTemplates(templatePayload.templates);
+      setDiagnostics(diagnosticsPayload);
+      setOllama(await api.ollamaModels().catch((error) => ({ models: [], error: String(error?.message ?? error) })));
     } catch (error) {
       toast.fail(error, "Could not load settings.");
     }
@@ -102,9 +107,10 @@ export default function SettingsPage() {
             <Cpu size={15} /> This machine
           </h2>
           <ul className="mt-2 space-y-1 text-xs text-mist-400">
-            <li>{hardware?.hardware.cpu ?? "detecting…"}</li>
+            <li>{hardware?.hardware.cpu?.name ?? "detecting…"}</li>
             <li>
-              {hardware?.hardware.cores ?? "?"} cores · {hardware?.hardware.ram_gb ?? "?"} GB RAM
+              {hardware?.hardware.cpu?.logical_cores ?? "?"} threads
+              ({hardware?.hardware.cpu?.physical_cores ?? "?"} cores) · {hardware?.hardware.memory?.total_gb ?? "?"} GB RAM
             </li>
             <li>
               GPU:{" "}
@@ -122,11 +128,15 @@ export default function SettingsPage() {
             <Wand2 size={15} /> Recommended
           </h2>
           <ul className="mt-2 space-y-1 text-xs text-mist-400">
-            <li>Whisper model: {hardware?.recommendation?.whisper_model ?? "…"}</li>
+            <li>Whisper model: {hardware?.hardware.recommended?.whisper_model ?? "…"}</li>
             <li>
-              Device: {hardware?.recommendation?.device ?? "…"} · {hardware?.recommendation?.compute_type ?? ""}
+              Device: {hardware?.hardware.recommended?.whisper_device ?? "…"} ·{" "}
+              {hardware?.hardware.recommended?.hw_accel === "none" ? "CPU encode" : hardware?.hardware.recommended?.hw_accel}
             </li>
-            <li className="pt-1 text-[11px] leading-relaxed">{hardware?.recommendation?.note}</li>
+            <li className="pt-1 text-[11px] leading-relaxed">
+              {hardware?.hardware.recommended?.concurrency ?? 1} clip render{hardware?.hardware.recommended?.concurrency === 1 ? "" : "s"} at a
+              time
+            </li>
           </ul>
         </div>
         <div className="card p-4">
@@ -134,11 +144,16 @@ export default function SettingsPage() {
             <Gauge size={15} /> Services
           </h2>
           <ul className="mt-2 space-y-1 text-xs text-mist-400">
-            <li>FFmpeg: {status?.ffmpeg?.available ? `${status.ffmpeg.version || "ready"}${status.ffmpeg.has_libass ? " · libass" : ""}` : "missing"}</li>
+            <li>FFmpeg: {status?.ffmpeg?.available ? `${status.ffmpeg.version || "ready"}${status.ffmpeg.libass ? " · libass" : ""}` : "missing"}</li>
             <li>Speech-to-text: {status?.ai?.faster_whisper ? "faster-whisper ready" : "not installed"}</li>
             <li>Vision: {status?.ai?.opencv ? "OpenCV ready" : "optional, not installed"}</li>
             <li>
-              Ollama: {status?.llm?.available ? `${status.llm.model}` : status?.llm?.error || "not reachable"}
+              Ollama:{" "}
+              {!values.llm_enabled
+                ? "disabled in AI & analysis"
+                : ollama.models.length
+                  ? `${ollama.models.length} model${ollama.models.length === 1 ? "" : "s"} · ${String(values.llm_model ?? "")}`
+                  : ollama.error || "not reachable"}
             </li>
           </ul>
           <div className="mt-2 flex gap-2">
@@ -146,7 +161,9 @@ export default function SettingsPage() {
               type="button"
               className="btn btn-quiet text-xs"
               onClick={async () => {
-                const result = await api.testOllama(status?.llm?.model ? "" : "", "").catch(() => null);
+                const result = await api
+                  .testOllama("", String(values.llm_model ?? ""))
+                  .catch(() => null);
                 const models = await api.ollamaModels().catch(() => ({ models: [], error: "unreachable" }));
                 setOllama(models);
                 toast.ok(result ? "Ollama answered" : "Ollama check finished", models.error);
@@ -226,15 +243,17 @@ export default function SettingsPage() {
       <section className="card p-4">
         <h2 className="text-sm font-bold text-mist-200">Storage</h2>
         <ul className="mt-2 space-y-1 text-xs text-mist-400">
-          <li>Data directory: <span className="mono">{status?.data_dir}</span></li>
-          <li>Exports: <span className="mono">{status?.exports_dir}</span></li>
-          <li>Database: <span className="mono">{status?.database}</span></li>
+          <li>Data directory: <span className="mono">{diagnostics?.paths?.data_dir ?? status?.data_dir}</span></li>
+          <li>Exports: <span className="mono">{diagnostics?.paths?.exports}</span></li>
+          <li>Database: <span className="mono">{diagnostics?.paths?.database}</span></li>
           {status?.ai?.faster_whisper_version ? <li>faster-whisper {status.ai.faster_whisper_version}</li> : null}
         </ul>
         {status?.notes?.length ? (
           <ul className="mt-2 space-y-1 text-[11px] text-amber-glow">
             {status.notes.map((note, index) => (
-              <li key={index}>· {note}</li>
+              <li key={index} title={note.detail}>
+                · {note.title}
+              </li>
             ))}
           </ul>
         ) : null}

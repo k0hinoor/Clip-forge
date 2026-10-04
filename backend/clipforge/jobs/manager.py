@@ -36,19 +36,25 @@ class JobManager:
 
     # ------------------------------------------------------------ lifecycle
     def start(self, *, workers: int | None = None) -> dict[str, Any]:
+        started: list[Worker] = []
         with self._lock:
             if self._workers:
-                return self.status()
-            settings = get_settings()
-            count = max(1, min(workers if workers is not None else settings.concurrency + settings.max_concurrent_renders - 1, 8))
-            self._render_lock = threading.Semaphore(max(1, settings.max_concurrent_renders))
-            self._stop.clear()
-            self._workers = [Worker(f"worker-{index + 1}", stop_event=self._stop) for index in range(count)]
-            for worker in self._workers:
-                worker.start()
-            self._started_at = time.time()
-        log.info("job manager started with %d worker(s)", len(self._workers))
-        BUS.publish("worker.started", {"workers": len(self._workers)})
+                pass  # already running - fall through and report the current state
+            else:
+                settings = get_settings()
+                count = max(1, min(workers if workers is not None else settings.concurrency + settings.max_concurrent_renders - 1, 8))
+                self._render_lock = threading.Semaphore(max(1, settings.max_concurrent_renders))
+                self._stop.clear()
+                self._workers = [Worker(f"worker-{index + 1}", stop_event=self._stop) for index in range(count)]
+                for worker in self._workers:
+                    worker.start()
+                self._started_at = time.time()
+                started = list(self._workers)
+        # Never call status() from inside the lock: it takes the lock itself and a
+        # plain Lock is not reentrant (the API hung forever on a second start).
+        if started:
+            log.info("job manager started with %d worker(s)", len(started))
+            BUS.publish("worker.started", {"workers": len(started)})
         return self.status()
 
     def stop(self, *, timeout: float = 6.0) -> None:

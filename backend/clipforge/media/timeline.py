@@ -106,6 +106,9 @@ class Timeline:
             "segments": [segment.to_dict() for segment in self.segments],
             "speed": round(self.speed, 4),
             "output_duration": round(self.output_duration, 3),
+            # The removed intervals are persisted so a reloaded plan can still say
+            # exactly how much silence was cut instead of reporting 0.0s.
+            "removed": [[round(begin, 3), round(stop, 3)] for begin, stop in self.removed],
             "removed_seconds": round(self.removed_seconds, 3),
             "trimmed": self.is_trimmed,
             "notes": self.notes,

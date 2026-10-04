@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 
-def test_defaults_match_the_product_spec(settings):
+def test_defaults_match_the_product_spec():
+    from clipforge.config import AppSettings
+
+    # Deliberately *not* the live store: other tests change settings, and this
+    # test is about what a fresh install ships with.
+    settings = AppSettings()
     assert settings.aspect_ratio == "9:16"
     assert (settings.output_width, settings.output_height) == (1080, 1920)
     assert settings.output_fps == 30

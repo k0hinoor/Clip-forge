@@ -617,12 +617,22 @@ def _transcript_from_files(
         return None
 
     source = candidates[0]
-    report.sub(0.05, f"using the transcript file you provided ({source.name})")
-    words = parse_transcript_file(source)
+    words: list[dict[str, Any]] = []
+    for candidate in candidates:
+        # A file can pass the extension/size filter and still hold no cues, so work
+        # down the priority list until one of them actually yields words.
+        parsed = parse_transcript_file(candidate)
+        if parsed:
+            source, words = candidate, parsed
+            break
+        report.log(f"{candidate.name} contained no readable timings - trying the next transcript file")
+        log.warning("provided transcript %s could not be parsed", candidate)
+
     if not words:
-        report.log(f"{source.name} contained no readable timings - falling back to speech recognition")
-        log.warning("provided transcript %s could not be parsed", source)
+        report.log("none of the supplied transcript files contained readable timings - falling back to speech recognition")
         return None
+
+    report.sub(0.05, f"using the transcript file you provided ({source.name})")
 
     from ..ai.transcribe import Word
 

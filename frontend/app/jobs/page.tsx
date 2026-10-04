@@ -91,7 +91,7 @@ export default function JobsPage() {
       ) : null}
 
       <ul className="space-y-2">
-        {[...(queue?.running ?? []), ...(queue?.queued ?? []), ...jobs.filter((job) => ["finished", "failed", "cancelled"].includes(job.status))].map((job) => (
+        {[...(queue?.running ?? []), ...(queue?.queued ?? []), ...jobs.filter((job) => ["succeeded", "failed", "cancelled"].includes(job.status))].map((job) => (
           <li key={job.id} className="card-tight p-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="chip">{job.kind.replace(/_/g, " ")}</span>

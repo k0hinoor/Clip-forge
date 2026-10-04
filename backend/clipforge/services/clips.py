@@ -28,7 +28,7 @@ from ..media.compose import RenderSpec, command_preview
 from ..media.framing import crop_plan_from_dict
 from ..media.timeline import build_timeline
 from ..pipeline.context import ProjectPaths, find_media
-from ..pipeline.edit import load_timeline, rebuild_layout, resolve_asset
+from ..pipeline.edit import layout_payload, load_timeline, rebuild_layout, resolve_asset, set_layout_payload
 from ..pipeline.render import project_settings_for
 
 log = get_logger("clipforge.worker")
@@ -105,7 +105,8 @@ def clip_detail(clip_id: str) -> dict[str, Any]:
             raise not_found("Project", clip.project_id)
         settings = project_settings_for(project)
         payload = clip.to_dict(include_words=True)
-        layout = rebuild_layout(clip, settings)
+        plan = rebuild_layout(clip, settings)
+        layout = layout_payload(plan)
         timeline = load_timeline(clip, settings)
         project_snapshot = project.to_dict()
 
@@ -115,8 +116,8 @@ def clip_detail(clip_id: str) -> dict[str, Any]:
 
         with session_scope() as session:
             clip = session.get(Clip, clip_id)
-            plan = rebuild_captions(clip, settings, layout.get("language", "en"), [point.get("time", 0) for point in layout.get("zoom_points") or []])
-        captions = plan.to_dict() if plan else None
+            caption_plan = rebuild_captions(clip, settings, plan.get("language", "en"), [point.get("time", 0) for point in plan.get("zoom_points") or []])
+        captions = caption_plan.to_dict() if caption_plan else None
 
     detail = {
         **payload,
@@ -135,7 +136,7 @@ def clip_detail(clip_id: str) -> dict[str, Any]:
             "music": layout.get("music"),
             "notes": layout.get("notes") or [],
             "zoom_points": layout.get("zoom_points") or [],
-            "crop": layout.get("crop"),
+            "crop": plan.get("crop"),
             "timeline": timeline.to_dict(),
         },
         "captions": captions,
@@ -160,7 +161,8 @@ def update_clip(clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         if project is None:
             raise not_found("Project", clip.project_id)
         settings = project_settings_for(project)
-        layout = rebuild_layout(clip, settings)
+        plan = rebuild_layout(clip, settings)
+        layout = layout_payload(plan)
         project_id = clip.project_id
 
     overrides: dict[str, Any] = {}
@@ -263,7 +265,7 @@ def update_clip(clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         for key, value in overrides.items():
             setattr(clip, key, value)
         if structural or overrides:
-            clip.layout_json = json.dumps(layout)
+            clip.layout_json = json.dumps(set_layout_payload(plan, layout))
         if structural:
             clip.status = "pending"
             clip.progress = 0.0
