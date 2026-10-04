@@ -1,0 +1,185 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------ tokens */
+@theme {
+  --color-ink-950: #07090f;
+  --color-ink-900: #0b0f17;
+  --color-ink-850: #0f141d;
+  --color-ink-800: #141a26;
+  --color-ink-700: #1c2433;
+  --color-ink-600: #263043;
+  --color-ink-500: #37425a;
+  --color-mist-400: #8b97b0;
+  --color-mist-300: #a9b4c8;
+  --color-mist-200: #cfd6e4;
+  --color-flare-500: #ff4d6d;
+  --color-flare-400: #ff6b83;
+  --color-signal-500: #34d399;
+  --color-signal-400: #5eead4;
+  --color-amber-glow: #ffd166;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1100px 620px at 12% -10%, rgba(255, 77, 109, 0.11), transparent 60%),
+    radial-gradient(900px 520px at 88% 0%, rgba(52, 211, 153, 0.09), transparent 55%),
+    var(--color-ink-950);
+  color: var(--color-mist-200);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ------------------------------------------------------------- primitives */
+.card {
+  background: linear-gradient(180deg, rgba(20, 26, 38, 0.92), rgba(11, 15, 23, 0.92));
+  border: 1px solid var(--color-ink-700);
+  border-radius: 16px;
+}
+
+.card-tight {
+  background: rgba(15, 20, 29, 0.85);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 12px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: 10px;
+  padding: 0.55rem 0.95rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  transition: transform 0.08s ease, background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+  cursor: pointer;
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--color-flare-500), #ff8a5c);
+  color: #17060b;
+}
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--color-flare-400), #ffa273);
+}
+.btn-ghost {
+  background: rgba(38, 48, 67, 0.5);
+  color: var(--color-mist-200);
+  border-color: var(--color-ink-600);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: rgba(56, 70, 96, 0.6);
+}
+.btn-quiet {
+  background: transparent;
+  color: var(--color-mist-400);
+}
+.btn-quiet:hover:not(:disabled) {
+  color: var(--color-mist-200);
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  background: rgba(7, 9, 15, 0.72);
+  border: 1px solid var(--color-ink-600);
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+  color: var(--color-mist-200);
+  font-size: 0.9rem;
+  outline: none;
+}
+.input:focus,
+.select:focus,
+.textarea:focus {
+  border-color: var(--color-flare-500);
+  box-shadow: 0 0 0 3px rgba(255, 77, 109, 0.16);
+}
+.label {
+  display: block;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-mist-400);
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border: 1px solid var(--color-ink-600);
+  background: rgba(38, 48, 67, 0.4);
+  color: var(--color-mist-300);
+  white-space: nowrap;
+}
+.chip-good {
+  border-color: rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--color-signal-400);
+}
+.chip-warn {
+  border-color: rgba(255, 209, 102, 0.35);
+  background: rgba(255, 209, 102, 0.12);
+  color: var(--color-amber-glow);
+}
+.chip-bad {
+  border-color: rgba(255, 77, 109, 0.4);
+  background: rgba(255, 77, 109, 0.14);
+  color: var(--color-flare-400);
+}
+
+.scroll-thin::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: rgba(55, 66, 90, 0.75);
+  border-radius: 99px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+.pulse-soft {
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.slide-in {
+  animation: slide-in 0.22s ease-out both;
+}

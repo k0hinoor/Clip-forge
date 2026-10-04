@@ -1,0 +1,18 @@
+# Local AI stack. Install with:  pip install -r requirements-ai.txt
+#
+# faster-whisper is the primary speech-to-text engine (CTranslate2 backend,
+# works on CPU and on NVIDIA GPUs via cuBLAS).
+faster-whisper>=1.0.3
+
+# OpenCV gives real face detection for smart vertical reframing.
+# Without it CLIPFORGE uses a centre/motion-aware crop path instead.
+opencv-python-headless>=4.9
+
+# Bundled static ffmpeg/ffprobe binaries - only needed if you do not want to
+# install ffmpeg yourself. CLIPFORGE auto-discovers them if present.
+imageio-ffmpeg>=0.5
+
+# Optional: WhisperX adds wav2vec2 forced alignment (better word timings) and
+# pyannote based speaker diarization. It is heavy (pulls torch), install only if
+# you want maximum timestamp accuracy.
+# whisperx>=3.1
