@@ -4,31 +4,45 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+env/
 .pytest_cache/
-.ruff_cache/
 .mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
-build/
 dist/
+build/
 
-# Runtime data (uploads, renders, SQLite DB, model caches)
-backend/data/
-data/
-*.db
-*.db-wal
-*.db-shm
-models/
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+npm-debug.log*
+yarn-error.log*
 
-# Secrets
-.env
-!.env.example
+# CLIPFORGE runtime data - never commit user media, renders or logs
+/data/
+/logs/
+/projects/
+/exports/
+/downloads/
+
+# User media in the asset library (only the folder structure is versioned)
+assets/**/*.mp4
+assets/**/*.mov
+assets/**/*.mkv
+assets/**/*.webm
+assets/**/*.mp3
+assets/**/*.wav
+assets/**/*.m4a
+
+# Test fixtures (regenerate with tools/make_test_media.py)
+backend/tests/data/
 
 # Editors / OS
-.idea/
 .vscode/
+.idea/
 .DS_Store
-
-# Frontend (future)
-node_modules/
-.next/
+Thumbs.db
+*.swp
