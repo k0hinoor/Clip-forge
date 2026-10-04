@@ -25,9 +25,9 @@ const ICONS: Record<ToastKind, ReactNode> = {
 };
 
 const TONES: Record<ToastKind, string> = {
-  error: "border-flare-500/50 bg-flare-500/10 text-flare-400",
-  success: "border-signal-500/50 bg-signal-500/10 text-signal-400",
-  info: "border-ink-600 bg-ink-800 text-mist-200",
+  error: "text-bad",
+  success: "text-good",
+  info: "text-text-2",
 };
 
 export function ToastProvider({ children }: { children: ReactNode }) {
@@ -66,18 +66,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      <div className="fixed bottom-5 right-5 z-50 flex w-[min(94vw,420px)] flex-col gap-2">
+      <div className="fixed bottom-4 right-4 z-50 flex w-[min(94vw,380px)] flex-col gap-2">
         {toasts.map((toast) => (
           <div
             key={toast.id}
-            className={`slide-in card-tight flex items-start gap-3 border p-3 shadow-2xl backdrop-blur ${TONES[toast.kind]}`}
+            className="slide-in card flex items-start gap-3 p-3"
           >
-            <div className="mt-0.5 shrink-0">{ICONS[toast.kind]}</div>
+            <div className={`mt-0.5 shrink-0 ${TONES[toast.kind]}`}>{ICONS[toast.kind]}</div>
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-mist-200">{toast.title}</p>
-              {toast.hint ? <p className="mt-1 text-xs leading-relaxed text-mist-400">{toast.hint}</p> : null}
+              <p className="text-[13px] font-medium text-text">{toast.title}</p>
+              {toast.hint ? <p className="mt-0.5 text-xs leading-relaxed text-text-3">{toast.hint}</p> : null}
             </div>
-            <button type="button" className="btn-quiet -m-1 p-1" onClick={() => dismiss(toast.id)} aria-label="Dismiss">
+            <button type="button" className="btn btn-ghost btn-icon -m-1" onClick={() => dismiss(toast.id)} aria-label="Dismiss">
               <X size={14} />
             </button>
           </div>

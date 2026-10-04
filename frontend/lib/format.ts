@@ -40,10 +40,9 @@ export function when(value: string | undefined | null): string {
 }
 
 export function scoreTone(score: number): string {
-  if (score >= 82) return "text-signal-400";
-  if (score >= 70) return "text-amber-glow";
-  if (score >= 60) return "text-mist-300";
-  return "text-mist-400";
+  if (score >= 82) return "text-good";
+  if (score >= 70) return "text-warn";
+  return "text-text-2";
 }
 
 export function statusChip(status: string): { label: string; className: string } {

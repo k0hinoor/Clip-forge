@@ -27,6 +27,7 @@ from ..config import AppSettings, get_settings
 from ..errors import ClipForgeError, ErrorCode
 from ..logging_setup import get_logger
 from .captions import CaptionPlan, ass_escape_filter_path, write_ass, write_srt
+from ..system import ffmpeg_info
 from .ffmpeg import (
     FfmpegProgress,
     MediaInfo,
@@ -86,6 +87,7 @@ class RenderSpec:
     language: str = "en"
     title: str = ""
     subtitle_path: Path | None = None
+    srt_path: Path | None = None
     settings: AppSettings | None = None
     source_fps: float = 0.0      # measured input frame rate; 0 = unknown
     quality: str = "final"       # final | preview
@@ -438,10 +440,19 @@ def build_filter_graph(
             video_out = "[vframed]"
 
     # --------------------------------------------------------------- captions
-    if spec.captions and spec.captions.lines and spec.subtitle_path and settings.burn_captions:
-        subtitle_file = ass_escape_filter_path(spec.subtitle_path)
-        graph.append(f"{video_out}ass='{subtitle_file}':shaping=complex[vcaptioned]")
-        video_out = "[vcaptioned]"
+    if spec.captions and spec.captions.lines and spec.subtitle_path and settings.captions_enabled:
+        if ffmpeg_info().has_libass:
+            subtitle_file = ass_escape_filter_path(spec.subtitle_path)
+            graph.append(f"{video_out}ass='{subtitle_file}':shaping=complex[vcaptioned]")
+            video_out = "[vcaptioned]"
+        else:
+            # Degrade instead of failing: the clip still renders and the SRT is
+            # still exported, and the UI says exactly why there are no captions.
+            spec.notes.append(
+                "Captions were not burned in: this ffmpeg build has no libass. "
+                "The .srt file is still exported next to the clip."
+            )
+            log.warning("ffmpeg has no libass; captions will not be burned in")
 
     graph.append(f"{video_out}format=yuv420p[vout]")
 
@@ -538,7 +549,8 @@ def render(spec: RenderSpec, *, progress: Callable[[float, str], None] | None = 
         if spec.subtitle_path is None:
             spec.subtitle_path = spec.output_path.with_suffix(".ass")
         write_ass(spec.captions, spec.subtitle_path, width=spec.width, height=spec.height)
-        write_srt(spec.captions, spec.output_path.with_suffix(".srt"))
+        # The .srt lives next to the .ass so one folder holds the whole clip.
+        spec.srt_path = write_srt(spec.captions, spec.subtitle_path.with_suffix(".srt"))
 
     measured: dict[str, float] = {}
     if settings.normalize_loudness and spec.quality != "preview":

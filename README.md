@@ -1,13 +1,14 @@
 # CLIPFORGE AI
 
-**Local AI clipping studio for long-form video.** Paste a YouTube link (or drop a file), and CLIPFORGE
+**Local AI clipping studio for long-form video.** Paste any video link — YouTube, a direct `.mp4`
+file URL, Vimeo, X, Dailymotion or any other hosted stream — (or drop a file), and CLIPFORGE
 downloads it, transcribes it locally, finds *every* moment worth publishing, writes vertical clips with
 accurate word-level captions, and renders MP4s you can post.
 
 Everything runs on your own machine. No uploads, no accounts, no cloud, no per-minute billing.
 
 ```
-YouTube URL ─► download ─► 16 kHz audio ─► transcription (faster-whisper) ─► speaker diarization
+Video link ─► download ─► 16 kHz audio ─► transcription (faster-whisper) ─► speaker diarization
       ─► sentence & topic segmentation ─► candidate discovery ─► scoring ─► dedupe
       ─► boundary optimisation ─► reframing + captions + audio mix ─► FFmpeg render ─► 1080×1920 MP4
 ```
@@ -133,8 +134,10 @@ clean renders older than N days.
 
 ## Features
 
-**Input** — YouTube URLs (watch/short/embed/youtu.be links) via yt-dlp; local uploads (`.mp4`, `.mov`,
-`.mkv`, `.webm`, `.avi`, `.m4a`, `.mp3`, `.wav`); transcript files (`.json3`, `.srt`, `.vtt`,
+**Input** — any video link: YouTube (watch/short/embed/youtu.be), direct media file URLs (`.mp4`,
+`.mov`, `.webm`, … served over HTTP) and other hosted pages (Vimeo, X, Dailymotion, …) via yt-dlp;
+servers that refuse `HEAD` probes are handled with a ranged `GET` fallback; local uploads (`.mp4`,
+`.mov`, `.mkv`, `.webm`, `.avi`, `.m4a`, `.mp3`, `.wav`); transcript files (`.json3`, `.srt`, `.vtt`,
 timestamped `.txt`) attached to a project are used instead of ASR.
 
 **Transcription** — faster-whisper with word-level timestamps (CUDA if available, otherwise CPU int8),

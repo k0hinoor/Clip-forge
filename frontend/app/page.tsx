@@ -2,81 +2,109 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  AlertTriangle,
-  Clapperboard,
-  FileAudio,
-  Gauge,
-  Link2,
-  Loader2,
-  RefreshCw,
-  Scissors,
-  Sparkles,
-  Trash2,
-  Upload,
-  Wand2,
-} from "lucide-react";
+import { ChevronDown, Link2, Loader2, Plus, Trash2, Upload } from "lucide-react";
 import { api } from "@/lib/api";
 import { useToast } from "@/components/Toast";
 import { ProgressBar } from "@/components/Progress";
-import { clock, duration, statusChip, when } from "@/lib/format";
-import type { ProjectSummary, SystemStatus } from "@/lib/types";
+import { clock, statusChip, when } from "@/lib/format";
+import type { ProjectSummary } from "@/lib/types";
 
-const DEFAULTS = {
-  clip_mode: "balanced",
-  min_clip_seconds: 35,
-  target_clip_seconds: 60,
-  max_clip_seconds: 75,
-  min_score: 70,
-  aspect_ratio: "9:16",
-  layout: "split",
-  split_ratio: 65,
-  gameplay_enabled: true,
-  remove_silence: true,
-  captions_enabled: true,
-  llm_enabled: true,
-  translate_captions: false,
+const LENGTHS: Record<string, { min: number; target: number; max: number; label: string }> = {
+  short: { min: 15, target: 25, max: 30, label: "Short · 15–30 s" },
+  standard: { min: 35, target: 60, max: 75, label: "Standard · 35–75 s" },
+  long: { min: 60, target: 90, max: 120, label: "Long · 60–120 s" },
+  custom: { min: 35, target: 60, max: 75, label: "Custom" },
 };
+
+const RATIOS = [
+  ["9:16", "9:16 vertical"],
+  ["1:1", "1:1 square"],
+  ["16:9", "16:9 landscape"],
+];
+
+const LAYOUTS = [
+  ["podcast", "Full frame"],
+  ["blur", "Blurred background"],
+  ["cinematic", "Cinematic crop"],
+  ["split", "Split screen"],
+  ["gameplay", "Gameplay background"],
+  ["broll", "B-roll split"],
+];
+
+const CAPTION_STYLES = [
+  ["bold_creator", "Bold (Shorts classic)"],
+  ["minimal", "Minimal"],
+  ["karaoke", "Karaoke"],
+  ["cinematic", "Cinematic"],
+  ["highlight", "Highlight"],
+  ["documentary", "Documentary"],
+];
 
 export default function StudioPage() {
   const toast = useToast();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [status, setStatus] = useState<SystemStatus | null>(null);
   const [url, setUrl] = useState("");
-  const [options, setOptions] = useState(DEFAULTS);
-  const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [search, setSearch] = useState("");
+  const [advanced, setAdvanced] = useState(false);
+  const [lengthKey, setLengthKey] = useState("standard");
   const fileInput = useRef<HTMLInputElement>(null);
+
+  const [options, setOptions] = useState({
+    aspect_ratio: "9:16",
+    caption_preset: "bold_creator",
+    layout: "podcast",
+    split_ratio: 65,
+    remove_silence: true,
+    auto_zoom: true,
+    captions_enabled: true,
+    min_score: 70,
+    clip_mode: "balanced",
+    translate_captions: false,
+    llm_enabled: true,
+    min_clip_seconds: 35,
+    target_clip_seconds: 60,
+    max_clip_seconds: 75,
+  });
 
   const load = useCallback(
     async (silent = false) => {
       try {
-        const [list, system] = await Promise.all([api.projects(search), api.status()]);
+        const list = await api.projects();
         setProjects(list.projects);
-        setStatus(system);
       } catch (error) {
         if (!silent) toast.fail(error, "Could not load your projects.");
       }
     },
-    [search, toast],
+    [toast],
   );
 
   useEffect(() => {
     load();
-    const timer = window.setInterval(() => load(true), 8000);
+    const timer = window.setInterval(() => load(true), 6000);
     return () => window.clearInterval(timer);
   }, [load]);
 
-  const startFromUrl = async () => {
-    if (!url.trim()) {
-      toast.push({ kind: "error", title: "Paste a YouTube link first." });
+  const applyLength = (key: string) => {
+    setLengthKey(key);
+    const preset = LENGTHS[key];
+    setOptions((current) => ({
+      ...current,
+      min_clip_seconds: preset.min,
+      target_clip_seconds: preset.target,
+      max_clip_seconds: preset.max,
+    }));
+  };
+
+  const submit = async () => {
+    const link = url.trim();
+    if (!link) {
+      toast.push({ kind: "error", title: "Paste a video link first." });
       return;
     }
     setBusy(true);
     try {
-      const result = await api.createProject({ url: url.trim(), options });
-      toast.ok("Analysis queued", `Project ${result.project.title.slice(0, 48)} is being processed locally.`);
+      const result = await api.createProject({ url: link, options });
+      toast.ok("Analysis started", result.project.title);
       setUrl("");
       await load(true);
     } catch (error) {
@@ -86,11 +114,11 @@ export default function StudioPage() {
     }
   };
 
-  const startFromFile = async (file: File) => {
+  const upload = async (file: File) => {
     setBusy(true);
     try {
-      const result = await api.uploadProject(file, options, file.name.replace(/\.[^.]+$/, ""));
-      toast.ok("Upload received", "Analysis is running on your machine.");
+      await api.uploadProject(file, options, file.name.replace(/\.[^.]+$/, ""));
+      toast.ok("Upload received", file.name);
       await load(true);
     } catch (error) {
       toast.fail(error, "The upload could not be processed.");
@@ -101,7 +129,7 @@ export default function StudioPage() {
   };
 
   const remove = async (project: ProjectSummary) => {
-    if (!window.confirm(`Delete “${project.title}” and all of its renders?`)) return;
+    if (!window.confirm(`Delete “${project.title}” and its renders?`)) return;
     try {
       await api.deleteProject(project.id);
       toast.ok("Project deleted");
@@ -111,278 +139,248 @@ export default function StudioPage() {
     }
   };
 
-  const hardware = status?.hardware;
-  const recommendation = status?.hardware?.recommended;
-  const notices = status?.notes ?? [];
-
   return (
-    <div className="space-y-8">
-      <section className="card p-6">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <h1 className="text-2xl font-black tracking-tight text-mist-200">Turn long videos into shorts</h1>
-            <p className="mt-1 max-w-2xl text-sm leading-relaxed text-mist-400">
-              Paste a YouTube link or drop a file. CLIPFORGE downloads it, transcribes it locally, finds every moment
-              worth publishing, and renders vertical clips with captions - entirely on this machine.
-            </p>
-          </div>
-          {hardware ? (
-            <div className="chip">
-              <Gauge size={13} />
-              {hardware.cpu?.name?.split(" ").slice(0, 3).join(" ") || "CPU"} · {hardware.memory?.total_gb} GB RAM
-              {hardware.gpu?.available ? ` · ${hardware.gpu.devices?.[0]?.name ?? hardware.gpu.vendor}` : " · CPU only"}
-            </div>
-          ) : null}
-        </div>
-
-        <div className="mt-5 grid gap-3 lg:grid-cols-[1fr_auto_auto]">
-          <div className="relative">
-            <Link2 size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-mist-400" />
+    <div className="space-y-6">
+      <section className="card p-4">
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <div className="relative flex-1">
+            <Link2 size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-3" />
             <input
               className="input pl-9"
-              placeholder="https://www.youtube.com/watch?v=…"
+              placeholder="Paste a video link — YouTube, Vimeo, X, TikTok or a direct .mp4"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
-              onKeyDown={(event) => event.key === "Enter" && startFromUrl()}
+              onKeyDown={(event) => event.key === "Enter" && submit()}
+              spellCheck={false}
             />
           </div>
-          <button type="button" className="btn btn-primary" onClick={startFromUrl} disabled={busy}>
-            {busy ? <Loader2 size={15} className="animate-spin" /> : <Wand2 size={15} />}
-            Analyse &amp; cut
+          <button type="button" className="btn btn-primary" onClick={submit} disabled={busy}>
+            {busy ? <Loader2 size={15} className="animate-spin" /> : null}
+            Find clips
           </button>
-          <button type="button" className="btn btn-ghost" onClick={() => fileInput.current?.click()} disabled={busy}>
-            <Upload size={15} /> Upload file
+          <button type="button" className="btn btn-secondary" onClick={() => fileInput.current?.click()} disabled={busy}>
+            <Upload size={15} />
+            Upload
           </button>
           <input
             ref={fileInput}
             type="file"
             accept="video/*,audio/*"
             hidden
-            onChange={(event) => event.target.files?.[0] && startFromFile(event.target.files[0])}
+            onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])}
           />
         </div>
 
-        <div className="mt-4 grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          <Field label="Clip length (s)">
-            <div className="flex gap-2">
-              <input
-                className="input"
-                type="number"
-                value={options.min_clip_seconds}
-                min={10}
-                max={120}
-                onChange={(event) => setOptions({ ...options, min_clip_seconds: Number(event.target.value) })}
-              />
-              <input
-                className="input"
-                type="number"
-                value={options.target_clip_seconds}
-                min={15}
-                max={180}
-                onChange={(event) => setOptions({ ...options, target_clip_seconds: Number(event.target.value) })}
-              />
-              <input
-                className="input"
-                type="number"
-                value={options.max_clip_seconds}
-                min={20}
-                max={240}
-                onChange={(event) => setOptions({ ...options, max_clip_seconds: Number(event.target.value) })}
-              />
-            </div>
-          </Field>
-          <Field label={`Minimum score · ${options.min_score}`}>
-            <input
-              type="range"
-              min={50}
-              max={95}
-              step={1}
-              value={options.min_score}
-              onChange={(event) => setOptions({ ...options, min_score: Number(event.target.value) })}
-              className="w-full accent-flare-500"
-            />
-          </Field>
-          <Field label="How many clips">
-            <select
-              className="select"
-              value={options.clip_mode}
-              onChange={(event) => setOptions({ ...options, clip_mode: event.target.value })}
-            >
-              <option value="best">Only the strongest</option>
-              <option value="balanced">Balanced</option>
-              <option value="max">Everything publishable</option>
-            </select>
-          </Field>
-          <Field label="Aspect ratio">
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div>
+            <span className="label">Aspect ratio</span>
             <select
               className="select"
               value={options.aspect_ratio}
               onChange={(event) => setOptions({ ...options, aspect_ratio: event.target.value })}
             >
-              <option value="9:16">9:16 vertical</option>
-              <option value="1:1">1:1 square</option>
-              <option value="16:9">16:9 landscape</option>
+              {RATIOS.map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
             </select>
-          </Field>
-          <Field label="Layout">
+          </div>
+          <div>
+            <span className="label">Caption style</span>
+            <select
+              className="select"
+              value={options.caption_preset}
+              onChange={(event) => setOptions({ ...options, caption_preset: event.target.value })}
+            >
+              {CAPTION_STYLES.map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <span className="label">Clip length</span>
+            <select className="select" value={lengthKey} onChange={(event) => applyLength(event.target.value)}>
+              {Object.entries(LENGTHS).map(([key, preset]) => (
+                <option key={key} value={key}>
+                  {preset.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <span className="label">Layout</span>
             <select
               className="select"
               value={options.layout}
               onChange={(event) => setOptions({ ...options, layout: event.target.value })}
             >
-              <option value="split">Split screen</option>
-              <option value="podcast">Speaker full frame</option>
-              <option value="broll">With B-roll</option>
-              <option value="gameplay">Gameplay background</option>
-              <option value="blur">Blurred background</option>
-              <option value="cinematic">Cinematic</option>
-            </select>
-          </Field>
-          <Field label="Split ratio">
-            <select
-              className="select"
-              value={options.split_ratio}
-              onChange={(event) => setOptions({ ...options, split_ratio: Number(event.target.value) })}
-              disabled={!["split", "broll", "gameplay"].includes(options.layout)}
-            >
-              {[50, 60, 65, 70].map((ratio) => (
-                <option key={ratio} value={ratio}>
-                  {ratio} / {100 - ratio}
+              {LAYOUTS.map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
                 </option>
               ))}
             </select>
-          </Field>
+          </div>
         </div>
 
-        <button type="button" className="btn btn-quiet mt-2 px-0 text-xs" onClick={() => setAdvanced(!advanced)}>
-          {advanced ? "Hide" : "Show"} more options
+        <button
+          type="button"
+          className="mt-3 inline-flex items-center gap-1 text-xs text-text-3 hover:text-text-2"
+          onClick={() => setAdvanced(!advanced)}
+        >
+          <ChevronDown size={13} className={`transition-transform ${advanced ? "" : "-rotate-90"}`} />
+          Advanced
         </button>
 
         {advanced ? (
-          <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            <div className="card-tight flex items-center justify-between p-3">
-              <span className="text-xs text-mist-300">Remove silences</span>
-              <Toggle value={options.remove_silence} onChange={(value) => setOptions({ ...options, remove_silence: value })} />
+          <div className="mt-3 grid gap-3 border-t border-line pt-3 sm:grid-cols-2 lg:grid-cols-3">
+            <Toggle
+              label="Remove silences"
+              hint="Tighten pauses over 0.35 s"
+              value={options.remove_silence}
+              onChange={(value) => setOptions({ ...options, remove_silence: value })}
+            />
+            <Toggle
+              label="Burn in captions"
+              hint="Word-level subtitles on the video"
+              value={options.captions_enabled}
+              onChange={(value) => setOptions({ ...options, captions_enabled: value })}
+            />
+            <Toggle
+              label="Punch-ins"
+              hint="Small zoom on the strongest lines"
+              value={options.auto_zoom}
+              onChange={(value) => setOptions({ ...options, auto_zoom: value })}
+            />
+            <Toggle
+              label="Translate captions"
+              hint="Off: keep the spoken language"
+              value={options.translate_captions}
+              onChange={(value) => setOptions({ ...options, translate_captions: value })}
+            />
+            <Toggle
+              label="Local LLM review"
+              hint="Ollama, if it is running"
+              value={options.llm_enabled}
+              onChange={(value) => setOptions({ ...options, llm_enabled: value })}
+            />
+            <div>
+              <span className="label">Minimum score · {options.min_score}</span>
+              <input
+                type="range"
+                min={50}
+                max={95}
+                value={options.min_score}
+                onChange={(event) => setOptions({ ...options, min_score: Number(event.target.value) })}
+                className="w-full accent-accent"
+              />
             </div>
-            <div className="card-tight flex items-center justify-between p-3">
-              <span className="text-xs text-mist-300">Burn in captions</span>
-              <Toggle value={options.captions_enabled} onChange={(value) => setOptions({ ...options, captions_enabled: value })} />
+            <div>
+              <span className="label">How many clips</span>
+              <select
+                className="select"
+                value={options.clip_mode}
+                onChange={(event) => setOptions({ ...options, clip_mode: event.target.value })}
+              >
+                <option value="best">Only the strongest</option>
+                <option value="balanced">Balanced</option>
+                <option value="max">Everything publishable</option>
+              </select>
             </div>
-            <div className="card-tight flex items-center justify-between p-3">
-              <span className="text-xs text-mist-300">Use local LLM</span>
-              <Toggle value={options.llm_enabled} onChange={(value) => setOptions({ ...options, llm_enabled: value })} />
-            </div>
-            <div className="card-tight flex items-center justify-between p-3">
-              <span className="text-xs text-mist-300">Add gameplay</span>
-              <Toggle value={options.gameplay_enabled} onChange={(value) => setOptions({ ...options, gameplay_enabled: value })} />
-            </div>
-            <div className="card-tight flex items-center justify-between p-3">
-              <span className="text-xs text-mist-300">Translate captions</span>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] text-mist-400">off by default</span>
-                <Toggle value={options.translate_captions} onChange={(value) => setOptions({ ...options, translate_captions: value })} />
+            {lengthKey === "custom" ? (
+              <div className="sm:col-span-2">
+                <span className="label">Length range (seconds)</span>
+                <div className="flex gap-2">
+                  <input
+                    className="input"
+                    type="number"
+                    min={10}
+                    max={120}
+                    value={options.min_clip_seconds}
+                    onChange={(event) => setOptions({ ...options, min_clip_seconds: Number(event.target.value) })}
+                  />
+                  <input
+                    className="input"
+                    type="number"
+                    min={15}
+                    max={180}
+                    value={options.target_clip_seconds}
+                    onChange={(event) => setOptions({ ...options, target_clip_seconds: Number(event.target.value) })}
+                  />
+                  <input
+                    className="input"
+                    type="number"
+                    min={20}
+                    max={240}
+                    value={options.max_clip_seconds}
+                    onChange={(event) => setOptions({ ...options, max_clip_seconds: Number(event.target.value) })}
+                  />
+                </div>
               </div>
-            </div>
+            ) : null}
           </div>
         ) : null}
       </section>
 
-      {recommendation ? (
-        <div className="card-tight flex flex-wrap items-center gap-2 p-3 text-xs text-mist-300">
-          <Sparkles size={14} className="text-amber-glow" />
-          Whisper {recommendation.whisper_model} on {recommendation.whisper_device}
-          {recommendation.hw_accel && recommendation.hw_accel !== "none" ? ` · ${recommendation.hw_accel} encode` : " · CPU encode"}
-        </div>
-      ) : null}
-
-      {notices.map((note, index) => (
-        <div
-          key={index}
-          className="card-tight flex flex-wrap items-center gap-2 p-3 text-xs text-mist-300"
-        >
-          <AlertTriangle
-            size={14}
-            className={note.level === "error" ? "text-flare-400" : note.level === "warning" ? "text-amber-glow" : "text-mist-400"}
-          />
-          <span className="font-semibold text-mist-200">{note.title}</span>
-          <span className="text-mist-400">{note.detail}</span>
-        </div>
-      ))}
-
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center gap-3">
-          <h2 className="text-lg font-bold text-mist-200">Your projects</h2>
-          <input
-            className="input ml-auto max-w-xs"
-            placeholder="Search…"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-          />
-          <button type="button" className="btn btn-quiet" onClick={() => load()} aria-label="Refresh">
-            <RefreshCw size={15} />
-          </button>
+      <section className="space-y-2">
+        <div className="flex items-baseline justify-between">
+          <h2 className="panel-title">Projects</h2>
+          <span className="text-xs text-text-3">{projects.length}</span>
         </div>
 
         {projects.length === 0 ? (
-          <div className="card flex flex-col items-center gap-2 p-10 text-center">
-            <Clapperboard size={26} className="text-mist-400" />
-            <p className="text-sm font-semibold text-mist-300">No projects yet</p>
-            <p className="max-w-md text-xs text-mist-400">
-              Paste a link above to create your first one. A 1-hour episode usually takes a few minutes to transcribe on
-              CPU and a couple of minutes per clip to render.
+          <div className="card flex flex-col items-center gap-1 px-6 py-12 text-center">
+            <Plus size={20} className="text-text-3" />
+            <p className="mt-1 text-sm font-medium text-text-2">No projects yet</p>
+            <p className="max-w-sm text-xs text-text-3">
+              Paste a link above. Analysis runs on this machine; a one-hour episode takes a few minutes to transcribe.
             </p>
           </div>
         ) : (
-          <ul className="grid gap-3 lg:grid-cols-2">
+          <ul className="card divide-y divide-line overflow-hidden">
             {projects.map((project) => {
               const chip = statusChip(project.status);
-              const active = project.active_job;
+              const working = project.status === "analyzing" || project.status === "queued";
               return (
-                <li key={project.id} className="card p-4">
-                  <div className="flex items-start gap-3">
-                    <div className="min-w-0 flex-1">
-                      <Link href={`/projects/${project.id}`} className="block truncate font-semibold text-mist-200 hover:text-flare-400">
-                        {project.title}
-                      </Link>
-                      <p className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-mist-400">
-                        <span>{when(project.created_at)}</span>
-                        {project.duration ? <span>{clock(project.duration, true)} long</span> : null}
-                        {project.clip_count ? <span>{project.clip_count} clips</span> : null}
-                        {project.rendered_clips ? <span>{project.rendered_clips} rendered</span> : null}
-                        {project.language ? (
-                          <span>
-                            {project.language}
-                            {project.language_mode !== "monolingual" ? ` · ${project.language_mode}` : ""}
-                          </span>
-                        ) : null}
-                      </p>
-                    </div>
-                    <span className={chip.className}>{chip.label}</span>
-                    <button type="button" className="btn btn-quiet p-1.5" onClick={() => remove(project)} aria-label="Delete">
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                  {project.status === "analyzing" || project.status === "queued" ? (
-                    <div className="mt-3 space-y-1.5">
-                      <ProgressBar value={project.progress} />
-                      <p className="text-[11px] text-mist-400">
-                        {Math.round((project.progress || 0) * 100)}% · {project.status_message || project.stage}
-                      </p>
-                    </div>
-                  ) : null}
-                  {project.error_message ? (
-                    <p className="mt-2 text-[11px] text-flare-400">{project.error_message}</p>
-                  ) : null}
-                  {project.word_count ? (
-                    <p className="mt-2 flex items-center gap-3 text-[11px] text-mist-400">
-                      <span className="inline-flex items-center gap-1">
-                        <FileAudio size={12} /> {project.word_count.toLocaleString()} words
-                      </span>
-                      <span className="inline-flex items-center gap-1">
-                        <Scissors size={12} /> {project.candidate_count} moments considered
-                      </span>
+                <li key={project.id} className="flex items-center gap-3 px-4 py-3">
+                  <div className="min-w-0 flex-1">
+                    <Link
+                      href={`/projects/${project.id}`}
+                      className="block truncate text-sm font-medium text-text hover:text-accent"
+                    >
+                      {project.title}
+                    </Link>
+                    <p className="mt-0.5 flex flex-wrap items-center gap-x-2.5 text-[11px] text-text-3">
+                      <span>{when(project.created_at)}</span>
+                      {project.duration ? <span>{clock(project.duration, true)}</span> : null}
+                      {project.clip_count ? <span>{project.clip_count} clips</span> : null}
+                      {project.rendered_clips ? <span>{project.rendered_clips} rendered</span> : null}
+                      {project.language ? <span>{project.language}</span> : null}
                     </p>
-                  ) : null}
+                    {working ? (
+                      <div className="mt-2 flex items-center gap-2">
+                        <ProgressBar value={project.progress} className="max-w-xs" />
+                        <span className="truncate text-[11px] text-text-3">
+                          {Math.round((project.progress || 0) * 100)}% · {project.status_message || project.stage}
+                        </span>
+                      </div>
+                    ) : null}
+                    {project.error_message ? (
+                      <p className="mt-1 truncate text-[11px] text-bad">{project.error_message}</p>
+                    ) : null}
+                  </div>
+                  <span className={chip.className}>{chip.label}</span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-icon"
+                    onClick={() => remove(project)}
+                    aria-label={`Delete ${project.title}`}
+                  >
+                    <Trash2 size={14} />
+                  </button>
                 </li>
               );
             })}
@@ -393,26 +391,35 @@ export default function StudioPage() {
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <span className="label">{label}</span>
-      {children}
-    </div>
-  );
-}
-
-function Toggle({ value, onChange }: { value: boolean; onChange: (value: boolean) => void }) {
+function Toggle({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  value: boolean;
+  onChange: (value: boolean) => void;
+}) {
   return (
     <button
       type="button"
       onClick={() => onChange(!value)}
-      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${value ? "bg-signal-500/80" : "bg-ink-600"}`}
+      className="flex items-center justify-between gap-3 rounded-md border border-line bg-surface-2 px-3 py-2 text-left"
       aria-pressed={value}
     >
+      <span className="min-w-0">
+        <span className="block text-[13px] font-medium text-text">{label}</span>
+        {hint ? <span className="block truncate text-[11px] text-text-3">{hint}</span> : null}
+      </span>
       <span
-        className={`absolute top-0.5 h-4 w-4 rounded-full bg-mist-200 transition-all ${value ? "left-[1.15rem]" : "left-0.5"}`}
-      />
+        className={`relative h-4 w-7 shrink-0 rounded-full transition-colors ${value ? "bg-accent" : "bg-line-strong"}`}
+      >
+        <span
+          className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${value ? "left-3.5" : "left-0.5"}`}
+        />
+      </span>
     </button>
   );
 }

@@ -28,7 +28,7 @@ from ..media.compose import RenderSpec, command_preview
 from ..media.framing import crop_plan_from_dict
 from ..media.timeline import build_timeline
 from ..pipeline.context import ProjectPaths, find_media
-from ..pipeline.edit import layout_payload, load_timeline, rebuild_layout, resolve_asset, set_layout_payload
+from ..pipeline.edit import clip_settings, layout_payload, load_timeline, rebuild_layout, resolve_asset, set_layout_payload
 from ..pipeline.render import project_settings_for
 
 log = get_logger("clipforge.worker")
@@ -82,6 +82,15 @@ def load_project_sentences(project_id: str) -> list[Sentence]:
     return build_sentences(utterances)
 
 
+def _stored_layout(clip_id: str) -> dict[str, Any]:
+    """The clip's stored plan layout block (used to show the effective style)."""
+    with session_scope() as session:
+        clip = session.get(Clip, clip_id)
+        if clip is None:
+            return {}
+        return layout_payload(rebuild_layout(clip, get_settings()))
+
+
 def words_in_range(sentences: Sequence[Sentence], start: float, end: float) -> list[Word]:
     words: list[Word] = []
     for sentence in sentences:
@@ -110,6 +119,7 @@ def clip_detail(clip_id: str) -> dict[str, Any]:
         timeline = load_timeline(clip, settings)
         project_snapshot = project.to_dict()
 
+    settings = clip_settings(settings, layout)  # honour the clip's own caption choices
     captions = None
     if settings.captions_enabled:
         from ..pipeline.edit import rebuild_captions
@@ -117,7 +127,9 @@ def clip_detail(clip_id: str) -> dict[str, Any]:
         with session_scope() as session:
             clip = session.get(Clip, clip_id)
             caption_plan = rebuild_captions(clip, settings, plan.get("language", "en"), [point.get("time", 0) for point in plan.get("zoom_points") or []])
-        captions = caption_plan.to_dict() if caption_plan else None
+        # The full theme travels with the plan so the editor can show which
+        # style is actually active (and re-render with exactly that style).
+        captions = {**caption_plan.to_dict(), "theme": settings.caption.model_dump()} if caption_plan else None
 
     detail = {
         **payload,
@@ -140,6 +152,7 @@ def clip_detail(clip_id: str) -> dict[str, Any]:
             "timeline": timeline.to_dict(),
         },
         "captions": captions,
+        "captions_enabled": bool(settings.captions_enabled),
         "caption_presets": sorted({*(layout.get("caption_presets") or []), "minimal", "cinematic", "bold_creator", "karaoke", "highlight", "documentary"}),
         "needs_render": payload["status"] != "rendered",
     }
@@ -246,6 +259,22 @@ def update_clip(clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             match = next((asset for asset in list_assets("music") if asset["id"] == asset_id), None)
             layout["music"] = {"id": asset_id, "name": match["name"] if match else asset_id, "path": match["path"] if match else "", "reason": "manually selected"}
 
+    if patch.get("caption_preset"):
+        # The editor sends a preset name; turn it into the theme it defines and
+        # store that, so the render reads back exactly what the user picked.
+        from ..constants import CAPTION_PRESETS
+
+        preset_name = str(patch["caption_preset"])
+        if preset_name not in CAPTION_PRESETS:
+            raise ClipForgeError(
+                code=ErrorCode.INVALID_INPUT,
+                message=f"Unknown caption style '{preset_name}'.",
+                hint="Choose one of: " + ", ".join(sorted(CAPTION_PRESETS)),
+                status_code=422,
+            )
+        layout["caption"] = preset_theme(preset_name, settings.caption).model_dump()
+        structural = True
+
     if patch.get("caption") is not None:
         structural = True
         theme = settings.caption.model_dump()
@@ -272,7 +301,10 @@ def update_clip(clip_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             clip.stage = "edited"
         session.flush()
         payload = clip.to_dict(include_words=True)
-    log.info("clip %s updated (%s)", clip_id, ", ".join(sorted({*(overrides.keys()), *(k for k, v in layout_keys.items() if v is not None)})))
+    changed = sorted({*(overrides.keys()), *(key for key, value in layout_keys.items() if value is not None),
+                      *(("caption_preset",) if patch.get("caption_preset") else ()),
+                      *(("caption",) if patch.get("caption") is not None else ())})
+    log.info("clip %s updated (%s)", clip_id, ", ".join(changed))
     return {**payload, "needs_render": payload["status"] != "rendered"}
 
 
@@ -465,6 +497,11 @@ def caption_preview(clip_id: str, *, preset: str | None = None, theme: dict[str,
     base = settings.caption
     if preset:
         base = preset_theme(preset, base)
+    else:
+        # No explicit preset: fall back to the style stored on this clip.
+        stored = _stored_layout(clip_id).get("caption")
+        if isinstance(stored, dict) and stored:
+            base = CaptionTheme.model_validate({**base.model_dump(), **stored})
     if theme:
         merged = base.model_dump()
         merged.update({key: value for key, value in theme.items() if key in merged})
@@ -473,7 +510,7 @@ def caption_preview(clip_id: str, *, preset: str | None = None, theme: dict[str,
         except Exception as exc:  # noqa: BLE001
             raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message=f"Invalid caption theme: {exc}", status_code=422) from exc
     plan = plan_captions(words, theme=base, language=language or "en")
-    return plan.to_dict()
+    return {**plan.to_dict(), "theme": base.model_dump(), "captions_enabled": settings.captions_enabled}
 
 
 def write_clip_srt(clip_id: str) -> Path:
@@ -500,7 +537,12 @@ def write_clip_srt(clip_id: str) -> Path:
         )
         for line in preview["lines"]
     ]
-    plan = CaptionPlan(lines=lines, theme=settings.caption, language=preview.get("language", "en"), font=preview.get("font", ""))
+    plan = CaptionPlan(
+        lines=lines,
+        theme=preview.get("theme") or settings.caption,
+        language=preview.get("language", "en"),
+        font=preview.get("font", ""),
+    )
     target = (paths.clip_dir(index) if paths else Path(get_settings().resolved_export_dir())) / f"{clip_id}.srt"
     return write_srt(plan, target)
 

@@ -1,22 +1,22 @@
 @import "tailwindcss";
 
 /* ------------------------------------------------------------------ tokens */
+/* One accent, flat surfaces, no gradients or glow. Everything below is a real
+   component primitive used by the pages - nothing is decorative. */
 @theme {
-  --color-ink-950: #07090f;
-  --color-ink-900: #0b0f17;
-  --color-ink-850: #0f141d;
-  --color-ink-800: #141a26;
-  --color-ink-700: #1c2433;
-  --color-ink-600: #263043;
-  --color-ink-500: #37425a;
-  --color-mist-400: #8b97b0;
-  --color-mist-300: #a9b4c8;
-  --color-mist-200: #cfd6e4;
-  --color-flare-500: #ff4d6d;
-  --color-flare-400: #ff6b83;
-  --color-signal-500: #34d399;
-  --color-signal-400: #5eead4;
-  --color-amber-glow: #ffd166;
+  --color-bg: #0e1013;
+  --color-surface: #15181d;
+  --color-surface-2: #1b1f25;
+  --color-line: #262b33;
+  --color-line-strong: #333a45;
+  --color-text: #e8eaee;
+  --color-text-2: #b3bac6;
+  --color-text-3: #7d8695;
+  --color-accent: #3d7bfd;
+  --color-accent-hover: #5a90ff;
+  --color-good: #3fb950;
+  --color-warn: #d29922;
+  --color-bad: #f0554a;
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
@@ -30,133 +30,172 @@ body {
 }
 
 body {
-  background:
-    radial-gradient(1100px 620px at 12% -10%, rgba(255, 77, 109, 0.11), transparent 60%),
-    radial-gradient(900px 520px at 88% 0%, rgba(52, 211, 153, 0.09), transparent 55%),
-    var(--color-ink-950);
-  color: var(--color-mist-200);
+  background: var(--color-bg);
+  color: var(--color-text);
   font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04";
 }
 
 /* ------------------------------------------------------------- primitives */
 .card {
-  background: linear-gradient(180deg, rgba(20, 26, 38, 0.92), rgba(11, 15, 23, 0.92));
-  border: 1px solid var(--color-ink-700);
-  border-radius: 16px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
 }
 
-.card-tight {
-  background: rgba(15, 20, 29, 0.85);
-  border: 1px solid var(--color-ink-700);
-  border-radius: 12px;
+.panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--color-text-2);
 }
 
 .btn {
   display: inline-flex;
   align-items: center;
-  gap: 0.5rem;
-  border-radius: 10px;
-  padding: 0.55rem 0.95rem;
-  font-size: 0.875rem;
-  font-weight: 600;
+  justify-content: center;
+  gap: 0.4rem;
+  border-radius: 6px;
   border: 1px solid transparent;
-  transition: transform 0.08s ease, background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+  padding: 0.45rem 0.8rem;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
   cursor: pointer;
-}
-.btn:active {
-  transform: translateY(1px);
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 .btn-primary {
-  background: linear-gradient(135deg, var(--color-flare-500), #ff8a5c);
-  color: #17060b;
+  background: var(--color-accent);
+  color: #fff;
 }
 .btn-primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, var(--color-flare-400), #ffa273);
+  background: var(--color-accent-hover);
+}
+.btn-secondary {
+  background: var(--color-surface-2);
+  border-color: var(--color-line-strong);
+  color: var(--color-text);
+}
+.btn-secondary:hover:not(:disabled) {
+  border-color: #48525f;
+  background: #22272f;
 }
 .btn-ghost {
-  background: rgba(38, 48, 67, 0.5);
-  color: var(--color-mist-200);
-  border-color: var(--color-ink-600);
+  background: transparent;
+  color: var(--color-text-2);
 }
 .btn-ghost:hover:not(:disabled) {
-  background: rgba(56, 70, 96, 0.6);
+  background: var(--color-surface-2);
+  color: var(--color-text);
 }
-.btn-quiet {
+.btn-danger {
   background: transparent;
-  color: var(--color-mist-400);
+  border-color: rgba(240, 85, 74, 0.4);
+  color: var(--color-bad);
 }
-.btn-quiet:hover:not(:disabled) {
-  color: var(--color-mist-200);
+.btn-danger:hover:not(:disabled) {
+  background: rgba(240, 85, 74, 0.12);
+}
+.btn-sm {
+  padding: 0.3rem 0.6rem;
+  font-size: 12px;
+}
+.btn-icon {
+  padding: 0.4rem;
 }
 
 .input,
 .select,
 .textarea {
   width: 100%;
-  background: rgba(7, 9, 15, 0.72);
-  border: 1px solid var(--color-ink-600);
-  border-radius: 10px;
-  padding: 0.6rem 0.75rem;
-  color: var(--color-mist-200);
-  font-size: 0.9rem;
+  background: #101318;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 6px;
+  padding: 0.5rem 0.65rem;
+  color: var(--color-text);
+  font-size: 13px;
   outline: none;
+  transition: border-color 0.12s ease;
+}
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--color-text-3);
 }
 .input:focus,
 .select:focus,
 .textarea:focus {
-  border-color: var(--color-flare-500);
-  box-shadow: 0 0 0 3px rgba(255, 77, 109, 0.16);
+  border-color: var(--color-accent);
 }
+.select {
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%237d8695' stroke-width='2.5'><path d='M6 9l6 6 6-6'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+  padding-right: 1.75rem;
+}
+.input:disabled,
+.select:disabled {
+  opacity: 0.5;
+}
+
 .label {
   display: block;
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--color-mist-400);
-  margin-bottom: 0.35rem;
+  font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-3);
+  margin-bottom: 0.3rem;
 }
 
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
-  border-radius: 999px;
-  padding: 0.2rem 0.6rem;
-  font-size: 0.72rem;
-  font-weight: 600;
-  border: 1px solid var(--color-ink-600);
-  background: rgba(38, 48, 67, 0.4);
-  color: var(--color-mist-300);
+  gap: 0.3rem;
+  border-radius: 4px;
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-surface-2);
+  padding: 0.1rem 0.4rem;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-text-2);
   white-space: nowrap;
 }
 .chip-good {
-  border-color: rgba(52, 211, 153, 0.35);
-  background: rgba(52, 211, 153, 0.12);
-  color: var(--color-signal-400);
+  border-color: rgba(63, 185, 80, 0.35);
+  background: rgba(63, 185, 80, 0.1);
+  color: var(--color-good);
 }
 .chip-warn {
-  border-color: rgba(255, 209, 102, 0.35);
-  background: rgba(255, 209, 102, 0.12);
-  color: var(--color-amber-glow);
+  border-color: rgba(210, 153, 34, 0.35);
+  background: rgba(210, 153, 34, 0.1);
+  color: var(--color-warn);
 }
 .chip-bad {
-  border-color: rgba(255, 77, 109, 0.4);
-  background: rgba(255, 77, 109, 0.14);
-  color: var(--color-flare-400);
+  border-color: rgba(240, 85, 74, 0.35);
+  background: rgba(240, 85, 74, 0.1);
+  color: var(--color-bad);
+}
+
+/* A quiet row divider used inside cards instead of nested boxes. */
+.rule {
+  border-top: 1px solid var(--color-line);
 }
 
 .scroll-thin::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
+  width: 8px;
+  height: 8px;
 }
 .scroll-thin::-webkit-scrollbar-thumb {
-  background: rgba(55, 66, 90, 0.75);
+  background: var(--color-line-strong);
   border-radius: 99px;
 }
 .scroll-thin::-webkit-scrollbar-track {
@@ -168,18 +207,14 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-@keyframes pulse-soft {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.45; }
-}
-.pulse-soft {
-  animation: pulse-soft 1.6s ease-in-out infinite;
+video {
+  background: #000;
 }
 
-@keyframes slide-in {
-  from { opacity: 0; transform: translateY(6px); }
+@keyframes cf-in {
+  from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
 }
 .slide-in {
-  animation: slide-in 0.22s ease-out both;
+  animation: cf-in 0.16s ease-out both;
 }

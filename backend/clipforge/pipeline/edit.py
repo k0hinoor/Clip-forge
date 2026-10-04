@@ -346,6 +346,43 @@ def load_timeline(clip: Any, settings: AppSettings) -> Timeline:
     return build_timeline(clip.start, clip.end, [], settings=settings)
 
 
+# Layout keys the clip editor stores per clip and that must be applied to the
+# render settings, otherwise the UI toggle would be decorative.
+CLIP_SETTING_KEYS = (
+    "captions_enabled",
+    "remove_silence",
+    "auto_zoom",
+    "gameplay_enabled",
+    "music_enabled",
+    "aspect_ratio",
+)
+
+
+def clip_settings(settings: AppSettings, layout: dict[str, Any]) -> AppSettings:
+    """Project settings with this clip's own overrides applied.
+
+    The clip editor writes ``captions_enabled``, ``aspect_ratio``, ``remove_silence``
+    and the caption theme into the clip's plan. Rendering has to read them back or
+    the editor's controls silently do nothing.
+    """
+    patch: dict[str, Any] = {
+        key: layout[key] for key in CLIP_SETTING_KEYS if layout.get(key) is not None
+    }
+    theme = layout.get("caption")
+    if isinstance(theme, dict) and theme:
+        try:
+            patch["caption"] = CaptionTheme.model_validate({**settings.caption.model_dump(), **theme}).model_dump()
+        except Exception:  # noqa: BLE001 - a stale theme must not break a render
+            log.warning("ignoring an unreadable caption theme stored on the clip")
+    if not patch:
+        return settings
+    try:
+        return AppSettings.model_validate({**settings.model_dump(), **patch})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ignoring clip overrides (%s)", exc)
+        return settings
+
+
 def rebuild_captions(clip: Any, settings: AppSettings, language: str, zoom_times: Sequence[float]) -> CaptionPlan | None:
     if not settings.captions_enabled:
         return None
@@ -429,6 +466,7 @@ __all__ = [
     "load_clip_words",
     "load_timeline",
     "plan_zoom_points",
+    "clip_settings",
     "rebuild_captions",
     "rebuild_layout",
     "layout_payload",

@@ -33,10 +33,11 @@ from ..db import Candidate, Clip, Project, session_scope, utcnow
 from ..errors import ClipForgeError, ErrorCode
 from ..logging_setup import get_logger
 from ..media.download import (
+    classify_url,
     download_captions,
     download_video,
     fetch_metadata,
-    parse_json3_captions,
+    parse_transcript_file,
 )
 from ..media.ffmpeg import extract_audio, probe_media
 from ..system import ai_stack, ensure_disk_space, ffmpeg_info, hardware
@@ -152,7 +153,7 @@ def analyze(
     t0 = time.time()
     media_info = None
     metadata: dict[str, Any] = {}
-    if source_type == "youtube":
+    if source_type in {"youtube", "url"}:
         meta = fetch_metadata(source_url)
         metadata = meta.to_dict()
         _update_project(
@@ -186,7 +187,7 @@ def analyze(
     report.stage("download", "acquiring the source video", fraction=0.02)
     t0 = time.time()
     media_path = _find_existing_media(paths)
-    if media_path is None and source_type == "youtube":
+    if media_path is None and source_type in {"youtube", "url"}:
         if media_info is None:
             media_info = None
         media_path = _download_source(project_id, source_url, paths, settings, report, metadata)
@@ -198,6 +199,14 @@ def analyze(
             status_code=500,
         )
     media_info = media_info or probe_media(media_path)
+    if media_info.duration > settings.max_source_hours * 3600:
+        # Direct links only reveal their length once the file is on disk.
+        raise ClipForgeError(
+            code=ErrorCode.VIDEO_TOO_LONG,
+            message=f"That video is {media_info.duration / 3600:.1f} hours long; the limit is {settings.max_source_hours:g} hours.",
+            hint="Raise the limit in Settings -> Video, or pick a shorter video.",
+            status_code=422,
+        )
     if not media_info.has_video:
         raise ClipForgeError(
             code=ErrorCode.UNSUPPORTED_FORMAT,
@@ -693,7 +702,7 @@ def _transcribe_from_captions(
             status_code=503,
         )
 
-    words = parse_json3_captions(caption_file)
+    words = parse_transcript_file(caption_file)
     if not words:
         raise ClipForgeError(
             code=ErrorCode.NO_SPEECH,
@@ -721,7 +730,7 @@ def _transcribe_from_captions(
         language=profile.primary or "en",
         language_confidence=profile.confidence,
         utterances=utterances,
-        engine="youtube-captions (fallback)",
+        engine="source captions (fallback)",
         model="caption-track",
         duration=utterances[-1].end if utterances else 0.0,
         diarized=False,

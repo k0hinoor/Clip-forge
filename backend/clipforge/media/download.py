@@ -1,4 +1,11 @@
-"""Source acquisition: YouTube (yt-dlp) and local uploads.
+"""Source acquisition: any video link (yt-dlp) and local uploads.
+
+Three kinds of link are accepted, and they all end up as a local file:
+
+* **YouTube** - watch, share, Shorts, embed and live URLs;
+* **direct media** - a plain ``.mp4`` / ``.mov`` / ``.mkv`` / ``.webm`` / HLS link;
+* **any other site** - everything yt-dlp knows how to extract (Vimeo, X/Twitter,
+  TikTok, Instagram, Dailymotion, Twitch VODs, …).
 
 Downloads never scrape copyrighted gameplay or music; they only fetch the video
 the user asked for. Everything is written inside the project directory so the
@@ -7,6 +14,7 @@ rest of the app can assume paths are local and containment-checked.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -27,6 +35,20 @@ YOUTUBE_HOSTS = {
 }
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
+
+#: Extensions that mean "this URL *is* the media file".
+DIRECT_MEDIA_SUFFIXES = {
+    ".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".flv", ".ts", ".m2ts",
+    ".mpg", ".mpeg", ".3gp", ".ogv", ".m3u8", ".mpd", ".mp3", ".m4a", ".wav", ".aac",
+}
+
+#: ``Content-Type`` prefixes that mark a URL as a direct media file.
+DIRECT_MEDIA_TYPES = ("video/", "audio/", "application/x-mpegurl", "application/vnd.apple.mpegurl", "application/dash+xml")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
 
 
 @dataclass
@@ -66,22 +88,141 @@ class SourceMetadata:
 # --------------------------------------------------------------------------- #
 
 
-def parse_youtube_url(url: str) -> str:
-    """Validate a YouTube URL and return the canonical 11-character video id."""
-    raw = (url or "").strip()
+@dataclass(frozen=True)
+class SourceRef:
+    """A validated video link, whatever site (or CDN) it points at."""
+
+    kind: str          # "youtube" | "direct" | "web"
+    url: str           # absolute URL handed to yt-dlp
+    source_id: str     # stable identifier (YouTube id, or a hash of the URL)
+    filename: str      # safe filename stem used for the downloaded file
+    label: str         # short human description for logs and errors
+    suffix: str = ""   # media extension, when the link exposes one
+
+    @property
+    def is_youtube(self) -> bool:
+        return self.kind == "youtube"
+
+    @property
+    def is_direct(self) -> bool:
+        return self.kind == "direct"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "url": self.url,
+            "source_id": self.source_id,
+            "filename": self.filename,
+            "label": self.label,
+            "suffix": self.suffix,
+        }
+
+
+def _stem_from_url(parsed: Any, fallback: str) -> str:
+    """A safe, readable filename stem derived from a URL path or query."""
+    path_name = Path(parsed.path or "").name
+    candidate = path_name if Path(path_name).suffix.lower() in DIRECT_MEDIA_SUFFIXES else ""
+    if not candidate:
+        # Delivery URLs often hide the real name in a query parameter
+        # (?file=episode.mp4); that beats an endpoint name like "get".
+        for key in ("file", "filename", "name", "title", "src", "url"):
+            value = (parse_qs(parsed.query or "").get(key) or [""])[0]
+            if value:
+                candidate = Path(value).name
+                break
+    candidate = candidate or path_name
+    stem = Path(candidate).stem if candidate else fallback
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")[:80]
+    return stem or fallback
+
+
+def classify_url(url: str, *, probe: bool = False) -> SourceRef:
+    """Turn any pasted link into a :class:`SourceRef` (or raise a friendly error).
+
+    Nothing here needs the network unless ``probe`` is set: a link is treated as
+    a direct media file when its path ends in a media extension, and otherwise it
+    is handed to yt-dlp, which knows how to extract from thousands of sites.
+    """
+    raw = (url or "").strip().strip("<>")
     if not raw:
-        raise invalid_input("Paste a YouTube URL first.", "Example: https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        raise invalid_input(
+            "Paste a video link first.",
+            "Example: https://www.youtube.com/watch?v=… or https://example.com/talk.mp4",
+        )
     if "://" not in raw:
         raw = "https://" + raw
+
     parsed = urlparse(raw)
-    host = (parsed.netloc or "").lower().split(":")[0]
-    if host not in YOUTUBE_HOSTS:
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
         raise ClipForgeError(
             code=ErrorCode.INVALID_URL,
-            message=f"{host or 'That URL'} is not a supported source.",
-            hint="CLIPFORGE accepts YouTube watch, share and Shorts URLs. For anything else, upload the file instead.",
+            message=f"'{scheme or raw}' links cannot be downloaded.",
+            hint="Paste an http(s) link to a video, or upload the file instead.",
             status_code=422,
         )
+
+    host = (parsed.netloc or "").lower().split(":")[0]
+    if not host or "." not in host:
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_URL,
+            message="That link does not point at a website.",
+            hint="Example: https://www.youtube.com/watch?v=… or https://example.com/talk.mp4",
+            status_code=422,
+        )
+
+    if host in YOUTUBE_HOSTS:
+        video_id = youtube_video_id(raw, parsed=parsed)
+        return SourceRef(kind="youtube", url=canonical_watch_url(video_id), source_id=video_id,
+                         filename=video_id, label="YouTube")
+
+    suffix = Path(parsed.path or "").suffix.lower()
+    if suffix not in DIRECT_MEDIA_SUFFIXES:
+        for value in parse_qs(parsed.query or "").values():
+            candidate = Path((value or [""])[0]).suffix.lower()
+            if candidate in DIRECT_MEDIA_SUFFIXES:
+                suffix = candidate
+                break
+    if probe and not suffix:
+        suffix = _probe_media_suffix(raw)
+
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    stem = _stem_from_url(parsed, digest)
+    if suffix:
+        return SourceRef(kind="direct", url=raw, source_id=digest, filename=stem, label=f"direct file · {host}", suffix=suffix)
+    return SourceRef(kind="web", url=raw, source_id=digest, filename=stem, label=host)
+
+
+def _probe_media_suffix(url: str) -> str:
+    """Best-effort ``Content-Type`` check for links with no extension."""
+    try:
+        import httpx
+
+        with httpx.Client(follow_redirects=True, timeout=12.0, headers={"User-Agent": USER_AGENT}) as client:
+            response = client.head(url)
+            if response.status_code >= 400:
+                response = client.get(url, headers={"Range": "bytes=0-0"})
+            content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    except Exception as exc:  # noqa: BLE001 - a failed probe only changes the label
+        log.debug("HEAD probe failed for %s: %s", url, exc)
+        return ""
+    if not content_type.startswith(DIRECT_MEDIA_TYPES):
+        return ""
+    guesses = {
+        "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+        "video/x-matroska": ".mkv", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+        "audio/wav": ".wav", "audio/x-wav": ".wav",
+    }
+    return guesses.get(content_type, ".mp4")
+
+
+def youtube_video_id(url: str, *, parsed: Any | None = None) -> str:
+    """Return the canonical 11-character id of a YouTube URL."""
+    raw = (url or "").strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = parsed or urlparse(raw)
+    host = (parsed.netloc or "").lower().split(":")[0]
 
     video_id = ""
     if host.endswith("youtu.be"):
@@ -103,6 +244,11 @@ def parse_youtube_url(url: str) -> str:
     return video_id
 
 
+def parse_youtube_url(url: str) -> str:
+    """Backwards-compatible helper: YouTube link in, video id out."""
+    return youtube_video_id(url)
+
+
 def canonical_watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
@@ -112,7 +258,7 @@ def canonical_watch_url(video_id: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _base_options(settings: AppSettings) -> dict[str, Any]:
+def _base_options(settings: AppSettings, source: SourceRef | None = None) -> dict[str, Any]:
     options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -125,8 +271,14 @@ def _base_options(settings: AppSettings) -> dict[str, Any]:
         "nocheckcertificate": False,
         "ignoreerrors": False,
         "age_limit": 99,
+        "http_headers": {"User-Agent": USER_AGENT},
         "extractor_args": {"youtube": {"player_client": ["default", "web_safari"]}},
     }
+    if source is not None and source.is_direct:
+        # A plain .mp4/.m3u8 link must not be scraped as a web page: force the
+        # generic extractor so yt-dlp streams the file instead of guessing.
+        options["force_generic_extractor"] = True
+        options["extractor_args"] = {}
     if settings.cookies_path and Path(settings.cookies_path).exists():
         options["cookiefile"] = settings.cookies_path
     if settings.proxy:
@@ -149,21 +301,41 @@ def fetch_metadata(url: str, *, progress: Callable[[str], None] | None = None) -
     """Read metadata without downloading (fast: used to show the video card)."""
     yt_dlp = _import_ytdlp()
     settings = get_settings()
-    video_id = parse_youtube_url(url)
-    options = _base_options(settings) | {"skip_download": True}
+    source = classify_url(url)
     if progress:
         progress("Reading video metadata")
 
+    if source.is_direct:
+        # A direct file has no page to scrape: the real metadata (duration,
+        # resolution) comes from ffprobe right after the download.
+        info: dict[str, Any] = {}
+        try:
+            info = _head_info(source.url)
+        except Exception as exc:  # noqa: BLE001 - metadata is a nicety
+            log.debug("HEAD failed for %s: %s", source.url, exc)
+        return SourceMetadata(
+            url=source.url,
+            video_id=source.source_id,
+            title=info.get("title") or source.filename,
+            channel=urlparse(source.url).netloc,
+            duration=float(info.get("duration") or 0),
+            thumbnail_url="",
+            description="",
+            webpage_url=source.url,
+            raw={"id": source.source_id, "extractor": "direct", "size_bytes": info.get("size_bytes", 0)},
+        )
+
+    options = _base_options(settings, source) | {"skip_download": True}
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(canonical_watch_url(video_id), download=False)
+            info = ydl.extract_info(source.url, download=False) or {}
     except Exception as exc:  # noqa: BLE001 - translated below
         raise from_download_error(exc) from exc
 
     if not info:
         raise ClipForgeError(
             code=ErrorCode.VIDEO_UNAVAILABLE,
-            message="YouTube returned no information for that video.",
+            message=f"{source.label} returned no information for that video.",
             status_code=404,
         )
 
@@ -176,13 +348,7 @@ def fetch_metadata(url: str, *, progress: Callable[[str], None] | None = None) -
         )
 
     duration = float(info.get("duration") or 0)
-    if duration and duration > settings.max_source_hours * 3600:
-        raise ClipForgeError(
-            code=ErrorCode.VIDEO_TOO_LONG,
-            message=f"That video is {duration / 3600:.1f} hours long; the limit is {settings.max_source_hours:g} hours.",
-            hint="Raise the limit in Settings -> Video, or pick a shorter video.",
-            status_code=422,
-        )
+    _check_duration(duration, settings)
 
     thumbnail = info.get("thumbnail") or ""
     if not thumbnail:
@@ -191,17 +357,17 @@ def fetch_metadata(url: str, *, progress: Callable[[str], None] | None = None) -
             thumbnail = thumbs[-1].get("url", "")
 
     return SourceMetadata(
-        url=canonical_watch_url(video_id),
-        video_id=video_id,
-        title=(info.get("title") or "Untitled video").strip(),
-        channel=(info.get("uploader") or info.get("channel") or "").strip(),
+        url=source.url,
+        video_id=info.get("id") or source.source_id,
+        title=(info.get("title") or source.filename or "Untitled video").strip(),
+        channel=(info.get("uploader") or info.get("channel") or urlparse(source.url).netloc or "").strip(),
         duration=duration,
         thumbnail_url=thumbnail,
         description=info.get("description") or "",
         upload_date=str(info.get("upload_date") or ""),
         view_count=int(info.get("view_count") or 0),
         is_live=bool(info.get("is_live")),
-        webpage_url=info.get("webpage_url") or canonical_watch_url(video_id),
+        webpage_url=info.get("webpage_url") or source.url,
         raw={
             "id": info.get("id"),
             "extractor": info.get("extractor"),
@@ -212,6 +378,37 @@ def fetch_metadata(url: str, *, progress: Callable[[str], None] | None = None) -
             "tags": (info.get("tags") or [])[:20],
         },
     )
+
+
+def _check_duration(duration: float, settings: AppSettings) -> None:
+    if duration and duration > settings.max_source_hours * 3600:
+        raise ClipForgeError(
+            code=ErrorCode.VIDEO_TOO_LONG,
+            message=f"That video is {duration / 3600:.1f} hours long; the limit is {settings.max_source_hours:g} hours.",
+            hint="Raise the limit in Settings -> Video, or pick a shorter video.",
+            status_code=422,
+        )
+
+
+def _head_info(url: str) -> dict[str, Any]:
+    """Cheap ``HEAD`` read: filename, size and (rarely) duration for direct links."""
+    import httpx
+
+    with httpx.Client(follow_redirects=True, timeout=15.0, headers={"User-Agent": USER_AGENT}) as client:
+        response = client.head(url)
+        if response.status_code >= 400:
+            # Some CDNs and dev servers refuse HEAD; a ranged GET says the same thing.
+            response = client.get(url, headers={"Range": "bytes=0-0"})
+    headers = response.headers
+    disposition = headers.get("content-disposition") or ""
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', disposition, re.IGNORECASE)
+    name = Path(match.group(1)).stem if match else ""
+    return {
+        "title": re.sub(r"[_+]+", " ", name).strip(),
+        "size_bytes": int(headers.get("content-length") or 0),
+        "duration": float(headers.get("x-content-duration") or 0),
+    }
+
 
 
 def _import_ytdlp():
@@ -246,7 +443,8 @@ def download_video(
     yt_dlp = _import_ytdlp()
     settings = get_settings()
     destination.mkdir(parents=True, exist_ok=True)
-    video_id = parse_youtube_url(url)
+    source = classify_url(url)
+    stem = source.filename or source.source_id
 
     state: dict[str, Any] = {"filename": "", "speed": 0.0, "eta": 0.0, "downloaded": 0, "total": 0}
 
@@ -274,9 +472,9 @@ def download_video(
             if progress:
                 progress(1.0, "merging streams")
 
-    options = _base_options(settings) | {
+    options = _base_options(settings, source) | {
         "format": format_selector(settings),
-        "outtmpl": {"default": str(destination / f"{video_id}.%(ext)s")},
+        "outtmpl": {"default": str(destination / f"{stem}.%(ext)s")},
         "merge_output_format": "mp4",
         "progress_hooks": [hook],
         "concurrent_fragment_downloads": max(1, settings.download_concurrency),
@@ -287,7 +485,7 @@ def download_video(
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(canonical_watch_url(video_id), download=True)
+            info = ydl.extract_info(source.url, download=True)
     except DownloadCancelled as exc:
         raise ClipForgeError(
             code=ErrorCode.CANCELLED,
@@ -297,7 +495,7 @@ def download_video(
     except Exception as exc:  # noqa: BLE001
         raise from_download_error(exc) from exc
 
-    media_path = _resolve_downloaded_path(destination, video_id, info)
+    media_path = _resolve_downloaded_path(destination, stem, info)
     if media_path is None:
         raise ClipForgeError(
             code=ErrorCode.DOWNLOAD_FAILED,
@@ -318,7 +516,7 @@ def _ffmpeg_available() -> bool:
         return False
 
 
-def _resolve_downloaded_path(destination: Path, video_id: str, info: dict[str, Any] | None) -> Path | None:
+def _resolve_downloaded_path(destination: Path, stem: str, info: dict[str, Any] | None) -> Path | None:
     candidates: list[Path] = []
     for key in ("requested_downloads", "entries"):
         for entry in (info or {}).get(key) or []:
@@ -335,10 +533,13 @@ def _resolve_downloaded_path(destination: Path, video_id: str, info: dict[str, A
         if candidate.exists() and candidate.stat().st_size > 0:
             return candidate
 
-    media_exts = {".mp4", ".mkv", ".webm", ".m4a", ".mov", ".mp3", ".opus", ".aac", ".flv", ".ts"}
+    media_exts = {".mp4", ".mkv", ".webm", ".m4a", ".mov", ".mp3", ".opus", ".aac", ".flv", ".ts", ".mpg", ".mpeg", ".ogv", ".3gp", ".m4v", ".avi"}
+    # Glob patterns treat [] as a character class, so an arbitrary filename stem
+    # is matched literally instead.
     matches = [
-        path for path in destination.glob(f"{video_id}*")
-        if path.suffix.lower() in media_exts and path.exists() and path.stat().st_size > 1024
+        path for path in destination.iterdir()
+        if path.is_file() and path.suffix.lower() in media_exts and path.stat().st_size > 1024
+        and (path.stem == stem or path.stem.startswith(f"{stem}."))
     ]
     if not matches:
         matches = [
@@ -360,34 +561,39 @@ _SUBTITLE_LANGS = ("en", "en-US", "en-GB", "hi", "hi-IN", "en-orig", "a.en")
 
 
 def download_captions(url: str, destination: Path, *, languages: tuple[str, ...] = _SUBTITLE_LANGS) -> Path | None:
-    """Download YouTube captions (manual first, automatic as fallback).
+    """Download the site's captions (manual first, automatic as fallback).
 
-    Used only when local speech-to-text is unavailable, and clearly labelled in
-    the UI as an external-caption fallback.
+    Works for any yt-dlp source that publishes a subtitle track - YouTube, Vimeo
+    and friends. A plain media file has no track, so it returns ``None`` and the
+    pipeline falls back to local speech recognition.
     """
+    source = classify_url(url)
+    if source.is_direct:
+        return None
     yt_dlp = _import_ytdlp()
     settings = get_settings()
     destination.mkdir(parents=True, exist_ok=True)
-    video_id = parse_youtube_url(url)
-    options = _base_options(settings) | {
+    stem = source.filename or source.source_id
+    options = _base_options(settings, source) | {
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitleslangs": list(languages),
-        "subtitlesformat": "json3",
-        "outtmpl": {"default": str(destination / f"{video_id}.%(ext)s")},
+        "subtitlesformat": "json3/vtt/srt/best",
+        "outtmpl": {"default": str(destination / f"{stem}.%(ext)s")},
     }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([canonical_watch_url(video_id)])
+            ydl.download([source.url])
     except Exception as exc:  # noqa: BLE001
         log.warning("caption download failed: %s", exc)
         return None
 
-    candidates = sorted(destination.glob(f"{video_id}*.json3"), key=lambda p: (len(p.name), p.name))
-    for candidate in candidates:
-        if candidate.exists() and candidate.stat().st_size > 64:
-            return candidate
+    for suffix in ("json3", "vtt", "srt"):
+        candidates = sorted(destination.glob(f"{stem}*.{suffix}"), key=lambda p: (len(p.name), p.name))
+        for candidate in candidates:
+            if candidate.exists() and candidate.stat().st_size > 64:
+                return candidate
     return None
 
 
@@ -621,9 +827,12 @@ def import_local_file(source: str | Path, destination: Path) -> Path:
 
 __all__ = [
     "ALLOWED_UPLOAD_EXTENSIONS",
+    "DIRECT_MEDIA_SUFFIXES",
     "TRANSCRIPT_EXTENSIONS",
     "SourceMetadata",
+    "SourceRef",
     "canonical_watch_url",
+    "classify_url",
     "download_captions",
     "download_video",
     "fetch_metadata",
@@ -633,6 +842,7 @@ __all__ = [
     "parse_subtitle_captions",
     "parse_transcript_file",
     "parse_youtube_url",
+    "youtube_video_id",
     "safe_upload_path",
     "transcript_files",
 ]

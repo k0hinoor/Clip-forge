@@ -21,7 +21,7 @@ def test_defaults_match_the_product_spec():
     assert settings.silence_min_duration == 0.35
     assert settings.split_ratio == 65
     assert settings.caption.preset in {"minimal", "cinematic", "bold_creator", "karaoke", "highlight", "documentary"}
-    assert settings.captions_enabled and settings.burn_captions
+    assert settings.captions_enabled  # one caption switch, not two that can disagree
     assert settings.translate_captions is False  # never translate unless asked
     assert 8.0 <= settings.target_lufs * -1 <= 16.0
 

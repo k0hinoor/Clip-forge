@@ -23,7 +23,7 @@ from ..media.ffmpeg import make_thumbnail, probe_media
 from ..media.framing import crop_plan_from_dict
 from ..system import ensure_disk_space, ffmpeg_info
 from .context import ProgressReporter, ProjectPaths, find_media
-from .edit import layout_payload, rebuild_captions, rebuild_layout, resolve_asset
+from .edit import clip_settings, layout_payload, rebuild_captions, rebuild_layout, resolve_asset
 
 log = get_logger("clipforge.render")
 
@@ -170,6 +170,7 @@ def render_clip(
         "height": stats["height"],
         "fps": int(round(stats["fps"] or spec.fps)),
         "subtitle_path": str(spec.subtitle_path) if spec.subtitle_path else "",
+        "srt_path": str(spec.srt_path) if spec.srt_path else "",
         "error_code": "",
         "error_message": "",
     }
@@ -222,6 +223,9 @@ def _build_spec_from_db(
             raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Clip not found.", status_code=404)
         plan = rebuild_layout(clip, settings)
         layout_settings = layout_payload(plan)
+        # Per-clip edits (caption style, captions on/off, aspect ratio, ...) live
+        # in the stored plan and must reach the encoder.
+        settings = clip_settings(settings, layout_settings)
         timeline = _load_timeline(clip, settings)
         zoom_points = [
             ZoomPoint(time=float(point.get("time", 0)), strength=float(point.get("strength", 1.0)), reason=str(point.get("reason", "")))

@@ -11,7 +11,7 @@ from ...config import Env, get_settings
 from ...errors import ClipForgeError, ErrorCode
 from ...logging_setup import recent_errors, tail_log
 from ...media.assets import ensure_seed_assets, library_summary
-from ...media.download import fetch_metadata, parse_youtube_url
+from ...media.download import classify_url, fetch_metadata
 from ...services import events
 from ...system import ai_stack, diagnostics, ffmpeg_info, hardware, process_snapshot
 from ..schemas import OllamaTestRequest
@@ -170,11 +170,12 @@ def list_ollama_models():
 
 
 @router.post("/youtube/probe")
-def probe_youtube(url: str = Body(..., embed=True)):
-    """Validate a URL and return metadata without downloading."""
-    video_id = parse_youtube_url(url)
-    meta = fetch_metadata(url)
-    return {"video_id": video_id, "metadata": meta.to_dict()}
+@router.post("/probe")
+def probe_source(url: str = Body(..., embed=True)):
+    """Validate any video link and return its metadata without downloading."""
+    source = classify_url(url)
+    meta = fetch_metadata(source.url)
+    return {"source": source.to_dict(), "video_id": meta.video_id, "metadata": meta.to_dict()}
 
 
 @router.get("/capabilities")

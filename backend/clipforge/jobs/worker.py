@@ -7,7 +7,7 @@ import time
 from typing import Any, Callable
 
 from ..constants import progress_for
-from ..db import Project, session_scope
+from ..db import Clip, Project, session_scope
 from ..errors import ClipForgeError, ErrorCode
 from ..logging_setup import get_logger
 from ..services.events import BUS
@@ -182,9 +182,11 @@ class Worker(threading.Thread):
                 result = run_job(job, worker_name=self.name)
                 if job_queue.is_cancelled(job["id"]):
                     job_queue.mark_cancelled(job["id"])
+                    _settle_project(job)
                     BUS.publish("job.cancelled", {"job_id": job["id"]}, project_id=job.get("project_id", ""), job_id=job["id"])
                 else:
                     job_queue.finish(job["id"], {**result, "duration_seconds": round(time.time() - started, 2)})
+                    _settle_project(job)
                     BUS.publish(
                         "job.finished",
                         {"job_id": job["id"], "kind": job["kind"], "result": result, "duration": round(time.time() - started, 2)},
@@ -199,6 +201,7 @@ class Worker(threading.Thread):
                     log.error("job %s failed: %s", job["id"], exc.message)
                     job_queue.fail(job["id"], code=exc.code, message=exc.message, hint=exc.hint)
                     _mark_project_failed(job, exc)
+                    _mark_clip_failed(job, exc)
                     BUS.publish(
                         "job.failed",
                         {"job_id": job["id"], "kind": job["kind"], "error": {"code": exc.code, "message": exc.message, "hint": exc.hint}},
@@ -210,6 +213,7 @@ class Worker(threading.Thread):
                 message = f"Unexpected error: {type(exc).__name__}: {exc}"[:400]
                 job_queue.fail(job["id"], code=ErrorCode.INTERNAL, message=message, hint="See logs/worker.log for the full traceback.")
                 _mark_project_failed(job, ClipForgeError(code=ErrorCode.INTERNAL, message=message))
+                _mark_clip_failed(job, ClipForgeError(code=ErrorCode.INTERNAL, message=message))
                 BUS.publish(
                     "job.failed",
                     {"job_id": job["id"], "kind": job["kind"], "error": {"code": ErrorCode.INTERNAL, "message": message}},
@@ -220,6 +224,55 @@ class Worker(threading.Thread):
                 self.current_job = ""
                 media_runner.kill_all()
         log.debug("%s stopped", self.name)
+
+
+def _settle_project(job: dict[str, Any]) -> None:
+    """Reset a project left `running` by a clip job's progress reports.
+
+    The analyse pipeline writes its own final state; render jobs only ever
+    push progress, so without this the project card stays stuck on the last
+    render stage (e.g. "generating a thumbnail") forever.
+    """
+    project_id = job.get("project_id")
+    if not project_id or job.get("kind") == "analyze":
+        return
+    with session_scope() as session:
+        project = session.get(Project, project_id)
+        if project is None or project.status not in {"running", "queued"}:
+            return
+        project.status = "ready"
+        project.stage = "ready"
+        project.status_message = "ready"
+        BUS.publish(
+            "project.updated",
+            {"project_id": project_id, "status": "ready", "stage": "ready"},
+            project_id=project_id,
+            job_id=job.get("id", ""),
+        )
+
+
+def _mark_clip_failed(job: dict[str, Any], error: ClipForgeError) -> None:
+    """Flip a clip out of `queued`/`rendering` when its render job fails.
+
+    Without this, a failed render job left the clip stuck in a queued state
+    forever while only the job list showed the error.
+    """
+    clip_id = job.get("clip_id")
+    if job.get("kind") not in {"render_clip", "render_preview"} or not clip_id:
+        return
+    with session_scope() as session:
+        clip = session.get(Clip, clip_id)
+        if clip is None:
+            return
+        clip.status = "failed"
+        clip.error_code = error.code
+        clip.error_message = error.message
+        BUS.publish(
+            "clip.updated",
+            {"clip_id": clip_id, "status": "failed", "error_message": error.message},
+            project_id=job.get("project_id", ""),
+            job_id=job.get("id", ""),
+        )
 
 
 def _mark_project_failed(job: dict[str, Any], error: ClipForgeError) -> None:

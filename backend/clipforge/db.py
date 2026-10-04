@@ -81,8 +81,8 @@ class Project(Base):
     channel: Mapped[str] = mapped_column(String(200), default="")
     description: Mapped[str] = mapped_column(Text, default="")
     source_url: Mapped[str] = mapped_column(Text, default="")
-    source_type: Mapped[str] = mapped_column(String(20), default="youtube")  # youtube | upload
-    source_id: Mapped[str] = mapped_column(String(80), default="")            # youtube video id
+    source_type: Mapped[str] = mapped_column(String(20), default="youtube")  # youtube | url | upload
+    source_id: Mapped[str] = mapped_column(String(80), default="")            # youtube id / link hash
     thumbnail_url: Mapped[str] = mapped_column(Text, default="")
     thumbnail_path: Mapped[str] = mapped_column(Text, default="")
     duration: Mapped[float] = mapped_column(Float, default=0.0)
@@ -173,6 +173,7 @@ class Project(Base):
             "clip_count": self.clip_count,
             "settings": self.settings,
             "media": self.media,
+            "paths": self.paths,
             "stats": json.loads(self.stats_json or "{}"),
             "error": (
                 {"code": self.error_code, "message": self.error_message, "hint": self.error_hint}

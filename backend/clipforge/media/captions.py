@@ -508,7 +508,8 @@ def _compose_words(
                 pieces.append(f"{{\\c{highlight}}}{text}{{\\c{primary}}}")
             else:
                 pieces.append(f"{{\\c{primary}}}{text}")
-        rendered_lines.append("".join(pieces))
+        # The spaces join the words; without them the line renders as one blob.
+        rendered_lines.append(" ".join(pieces))
     joined = "\\N".join(rendered_lines)
 
     intro = ""
@@ -532,7 +533,7 @@ def _karaoke_event(block: Sequence[CaptionLine], theme: CaptionTheme, start: flo
                 text = text.upper()
             tag = "\\kf" if word.emphasis else "\\k"
             pieces.append(f"{{{tag}{duration_cs}}}{text}")
-        rendered.append("".join(pieces))
+        rendered.append(" ".join(pieces))
     body = NEWLINE_TAG.join(rendered)
     return f"Dialogue: 0,{_timestamp(start)},{_timestamp(block[-1].end)},CF,,0,0,0,,{body}"
 

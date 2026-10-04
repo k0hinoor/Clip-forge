@@ -15,7 +15,7 @@ from ..constants import STAGES, stage_public_list
 from ..db import Candidate, Clip, Job, Project, TranscriptSegment, session_scope, slugify, utcnow
 from ..errors import ClipForgeError, ErrorCode, not_found
 from ..logging_setup import get_logger
-from ..media.download import parse_youtube_url
+from ..media.download import classify_url, parse_youtube_url
 from ..pipeline.context import ProjectPaths, find_media
 from . import events
 
@@ -38,10 +38,20 @@ def create_project(
     """Create a project row (no analysis yet)."""
     if source_type == "youtube":
         video_id = parse_youtube_url(url)
+    elif source_type == "url":
+        # Any other link: a direct .mp4 or a site yt-dlp can extract from.
+        video_id = classify_url(url).source_id
     else:
         video_id = ""
 
-    name = title or ("YouTube video" if source_type == "youtube" else (source_path.stem if source_path else "Uploaded video"))
+    if title:
+        name = title
+    elif source_type == "youtube":
+        name = "YouTube video"
+    elif source_type == "url":
+        name = "Linked video"
+    else:
+        name = source_path.stem if source_path else "Uploaded video"
     with session_scope() as session:
         project = Project(
             title=name[:400],
@@ -60,17 +70,19 @@ def create_project(
         snapshot = project.to_dict()
 
     paths = ProjectPaths.for_snapshot(snapshot).ensure()
-    if source_path is not None and source_type != "youtube":
+    # Store the layout now: the title changes once the real metadata arrives and
+    # the folder must not move out from under the files already inside it.
+    with session_scope() as session:
+        project = session.get(Project, project_id)
+        if project is not None:
+            project.paths_json = json.dumps(paths.to_dict())
+
+    if source_path is not None and source_type == "upload":
         from ..media.download import safe_upload_path
 
         target = safe_upload_path(paths.source, source_path.name)
         if source_path.resolve() != target.resolve():
             shutil.copy2(source_path, target)
-        with session_scope() as session:
-            project = session.get(Project, project_id)
-            if project is not None:
-                project.slug = slugify(name)
-                project.paths_json = json.dumps(paths.to_dict())
 
     log.info("created project %s (%s)", project_id, name[:60])
     events.publish("project.created", {"project": snapshot}, project_id=project_id)
