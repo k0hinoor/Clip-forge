@@ -1,24 +1,96 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Cpu, Gauge, HardDrive, RefreshCw, Save, Server, Terminal, Wand2 } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import { useToast } from "@/components/Toast";
-import { bytes } from "@/lib/format";
 import type { Diagnostics, HardwareReport, SettingsSchemaField, SystemStatus } from "@/lib/types";
 
-const SECTION_LABELS: Record<string, string> = {
-  general: "General",
-  ai: "AI & analysis",
-  transcription: "Transcription",
-  video: "Video & clips",
-  captions: "Captions",
-  gameplay: "Gameplay & layouts",
-  audio: "Audio",
-  export: "Export",
-  storage: "Storage",
-  advanced: "Advanced",
-};
+/** The sections the page shows, and the settings each one owns. */
+const GROUPS: { key: string; label: string; hint: string; fields: string[] }[] = [
+  {
+    key: "clips",
+    label: "Clips",
+    hint: "How moments are found and how long they are.",
+    fields: [
+      "clip_mode",
+      "min_clip_seconds",
+      "target_clip_seconds",
+      "max_clip_seconds",
+      "min_score",
+      "max_clips",
+      "remove_silence",
+      "silence_min_duration",
+      "silence_threshold_db",
+      "auto_zoom",
+      "smart_reframe",
+      "speaker_tracking",
+    ],
+  },
+  {
+    key: "output",
+    label: "Output",
+    hint: "Frame size, frame rate and encoder quality.",
+    fields: ["aspect_ratio", "output_width", "output_height", "output_fps", "render_preset", "crf", "audio_bitrate_kbps", "hw_accel"],
+  },
+  {
+    key: "captions",
+    label: "Captions",
+    hint: "Subtitles burned into every render.",
+    fields: ["captions_enabled", "translate_captions", "translation_language"],
+  },
+  {
+    key: "audio",
+    label: "Audio",
+    hint: "Voice treatment and loudness.",
+    fields: ["normalize_loudness", "target_lufs", "true_peak_db", "voice_boost", "voice_gain_db", "ducking", "music_enabled", "music_volume"],
+  },
+  {
+    key: "transcription",
+    label: "Transcription",
+    hint: "Local speech-to-text used to find the moments.",
+    fields: [
+      "whisper_model",
+      "whisper_device",
+      "whisper_compute_type",
+      "language_hint",
+      "diarization",
+      "max_speakers",
+      "word_alignment",
+      "llm_enabled",
+      "ollama_base_url",
+      "ollama_model",
+    ],
+  },
+  {
+    key: "sources",
+    label: "Downloads & uploads",
+    hint: "How source videos are fetched and stored.",
+    fields: [
+      "max_download_height",
+      "prefer_mp4",
+      "download_concurrency",
+      "max_source_hours",
+      "cookies_path",
+      "proxy",
+      "uploads_enabled",
+      "max_upload_gb",
+      "cache_downloads",
+    ],
+  },
+  {
+    key: "storage",
+    label: "Storage & files",
+    hint: "Where renders go and how long things are kept.",
+    fields: ["export_dir", "export_filename_template", "auto_open_folder", "keep_source_video", "cache_transcripts", "cleanup_days", "max_cache_gb"],
+  },
+  {
+    key: "advanced",
+    label: "Advanced",
+    hint: "Everything else, including ffmpeg paths and worker counts.",
+    fields: [],
+  },
+];
 
 export default function SettingsPage() {
   const toast = useToast();
@@ -26,30 +98,23 @@ export default function SettingsPage() {
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [hardware, setHardware] = useState<HardwareReport | null>(null);
   const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [templates, setTemplates] = useState<any[]>([]);
-  const [ollama, setOllama] = useState<{ models: string[]; error?: string }>({ models: [] });
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const [active, setActive] = useState("clips");
   const [busy, setBusy] = useState(false);
-  const [activeSection, setActiveSection] = useState("video");
 
   const load = useCallback(async () => {
     try {
-      const [schemaPayload, settingsPayload, hardwarePayload, statusPayload, templatePayload, diagnosticsPayload] =
-        await Promise.all([
-          api.settingsSchema(),
-          api.settings(),
-          api.hardware(),
-          api.status(),
-          api.templates(),
-          api.diagnostics(),
-        ]);
-      setSchema(schemaPayload.schema);
+      const [settingsPayload, hardwarePayload, statusPayload, diagnosticsPayload] = await Promise.all([
+        api.settings(),
+        api.hardware(),
+        api.status(),
+        api.diagnostics(),
+      ]);
+      setSchema(settingsPayload.schema);
       setValues(settingsPayload.settings);
       setHardware(hardwarePayload);
       setStatus(statusPayload);
-      setTemplates(templatePayload.templates);
       setDiagnostics(diagnosticsPayload);
-      setOllama(await api.ollamaModels().catch((error) => ({ models: [], error: String(error?.message ?? error) })));
     } catch (error) {
       toast.fail(error, "Could not load settings.");
     }
@@ -59,27 +124,28 @@ export default function SettingsPage() {
     load();
   }, [load]);
 
-  const sections = useMemo(() => {
-    const grouped: Record<string, SettingsSchemaField[]> = {};
-    for (const field of Object.values(schema)) {
-      grouped[field.section] = grouped[field.section] ?? [];
-      grouped[field.section].push(field);
-    }
-    return grouped;
-  }, [schema]);
-
   const save = async (patch: Record<string, unknown>) => {
     setBusy(true);
     try {
       const payload = await api.updateSettings(patch);
       setValues(payload.settings);
-      toast.ok("Settings saved");
+      toast.ok("Saved");
     } catch (error) {
       toast.fail(error, "That setting was rejected.");
     } finally {
       setBusy(false);
     }
   };
+
+  const shown = useMemo(() => {
+    const group = GROUPS.find((item) => item.key === active);
+    if (!group) return [];
+    if (group.key === "advanced") {
+      const claimed = new Set(GROUPS.flatMap((item) => item.fields));
+      return Object.values(schema).filter((field) => !claimed.has(field.name) && field.type !== "object");
+    }
+    return group.fields.map((name) => schema[name]).filter(Boolean);
+  }, [active, schema]);
 
   const update = (field: SettingsSchemaField, raw: unknown) => {
     let value: unknown = raw;
@@ -88,176 +154,113 @@ export default function SettingsPage() {
     save({ [field.name]: value });
   };
 
+  const group = GROUPS.find((item) => item.key === active);
+
   return (
-    <div className="space-y-5">
+    <div className="space-y-4">
       <header className="flex flex-wrap items-center gap-3">
         <div className="flex-1">
-          <h1 className="text-xl font-black text-mist-200">Settings</h1>
-          <p className="mt-0.5 text-xs text-mist-400">Stored locally in SQLite · nothing is uploaded anywhere.</p>
+          <h1 className="text-lg font-semibold tracking-tight text-text">Settings</h1>
+          <p className="mt-0.5 text-xs text-text-3">Saved on this machine. Changes apply to the next analysis or render.</p>
         </div>
-        <button type="button" className="btn btn-ghost" onClick={() => api.resetSettings().then(load)}>
+        <button type="button" className="btn btn-secondary" onClick={() => api.resetSettings().then(load)}>
           <RefreshCw size={14} /> Restore defaults
         </button>
       </header>
 
-      {/* ------------------------------------------------------ hardware */}
-      <section className="grid gap-3 lg:grid-cols-3">
-        <div className="card p-4">
-          <h2 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-            <Cpu size={15} /> This machine
-          </h2>
-          <ul className="mt-2 space-y-1 text-xs text-mist-400">
-            <li>{hardware?.hardware.cpu?.name ?? "detecting…"}</li>
-            <li>
-              {hardware?.hardware.cpu?.logical_cores ?? "?"} threads
-              ({hardware?.hardware.cpu?.physical_cores ?? "?"} cores) · {hardware?.hardware.memory?.total_gb ?? "?"} GB RAM
-            </li>
-            <li>
-              GPU:{" "}
-              {hardware?.hardware.gpu?.available
-                ? `${hardware.hardware.gpu.devices?.[0]?.name ?? hardware.hardware.gpu.vendor}${hardware.hardware.gpu.cuda ? " (CUDA)" : ""}`
-                : "none detected - CPU encoding"}
-            </li>
-            <li>
-              Disk: {hardware?.hardware.disk?.free_gb ?? "?"} GB free of {hardware?.hardware.disk?.total_gb ?? "?"} GB
-            </li>
-          </ul>
-        </div>
-        <div className="card p-4">
-          <h2 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-            <Wand2 size={15} /> Recommended
-          </h2>
-          <ul className="mt-2 space-y-1 text-xs text-mist-400">
-            <li>Whisper model: {hardware?.hardware.recommended?.whisper_model ?? "…"}</li>
-            <li>
-              Device: {hardware?.hardware.recommended?.whisper_device ?? "…"} ·{" "}
-              {hardware?.hardware.recommended?.hw_accel === "none" ? "CPU encode" : hardware?.hardware.recommended?.hw_accel}
-            </li>
-            <li className="pt-1 text-[11px] leading-relaxed">
-              {hardware?.hardware.recommended?.concurrency ?? 1} clip render{hardware?.hardware.recommended?.concurrency === 1 ? "" : "s"} at a
-              time
-            </li>
-          </ul>
-        </div>
-        <div className="card p-4">
-          <h2 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-            <Gauge size={15} /> Services
-          </h2>
-          <ul className="mt-2 space-y-1 text-xs text-mist-400">
-            <li>FFmpeg: {status?.ffmpeg?.available ? `${status.ffmpeg.version || "ready"}${status.ffmpeg.libass ? " · libass" : ""}` : "missing"}</li>
-            <li>Speech-to-text: {status?.ai?.faster_whisper ? "faster-whisper ready" : "not installed"}</li>
-            <li>Vision: {status?.ai?.opencv ? "OpenCV ready" : "optional, not installed"}</li>
-            <li>
-              Ollama:{" "}
-              {!values.llm_enabled
-                ? "disabled in AI & analysis"
-                : ollama.models.length
-                  ? `${ollama.models.length} model${ollama.models.length === 1 ? "" : "s"} · ${String(values.llm_model ?? "")}`
-                  : ollama.error || "not reachable"}
-            </li>
-          </ul>
-          <div className="mt-2 flex gap-2">
-            <button
-              type="button"
-              className="btn btn-quiet text-xs"
-              onClick={async () => {
-                const result = await api
-                  .testOllama("", String(values.llm_model ?? ""))
-                  .catch(() => null);
-                const models = await api.ollamaModels().catch(() => ({ models: [], error: "unreachable" }));
-                setOllama(models);
-                toast.ok(result ? "Ollama answered" : "Ollama check finished", models.error);
-              }}
-            >
-              <Server size={13} /> Test Ollama
-            </button>
-            <button type="button" className="btn btn-quiet text-xs" onClick={() => api.logs("render", 200).then((payload) => toast.push({ kind: "info", title: `${payload.lines.length} render log lines`, hint: payload.lines.slice(-3).join(" ⏎ ") }))}>
-              <Terminal size={13} /> Recent render log
-            </button>
-          </div>
-          {ollama.models?.length ? <p className="mt-2 text-[11px] text-mist-400">Installed models: {ollama.models.join(", ")}</p> : null}
-        </div>
-      </section>
-
-      {/* ------------------------------------------------------ templates */}
       <section className="card p-4">
-        <h2 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-          <HardDrive size={15} /> Templates
-        </h2>
-        <div className="mt-2 flex flex-wrap gap-2">
-          {templates.map((template) => (
-            <button
-              key={template.id}
-              type="button"
-              className="btn btn-ghost text-xs"
-              title={template.description}
-              onClick={async () => {
-                const payload = await api.applyTemplate(template.id).catch((error) => {
-                  toast.fail(error);
-                  return null;
-                });
-                if (payload) {
-                  toast.ok(`${template.name} applied`);
-                  setValues(payload.settings ?? values);
-                  await load();
-                }
-              }}
-            >
-              {template.name}
-            </button>
-          ))}
-          {templates.length === 0 ? <p className="text-xs text-mist-400">No saved templates yet.</p> : null}
-        </div>
-      </section>
-
-      {/* ------------------------------------------------------- sections */}
-      <div className="flex flex-wrap gap-1">
-        {Object.keys(sections).map((section) => (
-          <button
-            key={section}
-            type="button"
-            className={`btn ${activeSection === section ? "btn-ghost" : "btn-quiet"} text-xs`}
-            onClick={() => setActiveSection(section)}
-          >
-            {SECTION_LABELS[section] ?? section}
-          </button>
-        ))}
-      </div>
-
-      <section className="card p-4">
-        <div className="grid gap-4 md:grid-cols-2">
-          {(sections[activeSection] ?? []).map((field) => (
-            <Field
-              key={field.name}
-              field={field}
-              value={values[field.name] ?? field.value}
-              onCommit={(value) => update(field, value)}
-            />
-          ))}
-        </div>
-        <p className="mt-4 flex items-center gap-2 text-[11px] text-mist-400">
-          <Save size={12} /> Changes save immediately and apply to the next analysis or render.
-        </p>
-      </section>
-
-      <section className="card p-4">
-        <h2 className="text-sm font-bold text-mist-200">Storage</h2>
-        <ul className="mt-2 space-y-1 text-xs text-mist-400">
-          <li>Data directory: <span className="mono">{diagnostics?.paths?.data_dir ?? status?.data_dir}</span></li>
-          <li>Exports: <span className="mono">{diagnostics?.paths?.exports}</span></li>
-          <li>Database: <span className="mono">{diagnostics?.paths?.database}</span></li>
-          {status?.ai?.faster_whisper_version ? <li>faster-whisper {status.ai.faster_whisper_version}</li> : null}
-        </ul>
+        <h2 className="panel-title">This machine</h2>
+        <dl className="mt-2 grid gap-x-6 gap-y-1 text-xs sm:grid-cols-2">
+          <Row label="CPU" value={hardware?.hardware.cpu?.name ?? "detecting…"} />
+          <Row
+            label="Memory"
+            value={`${hardware?.hardware.cpu?.logical_cores ?? "?"} threads · ${hardware?.hardware.memory?.total_gb ?? "?"} GB`}
+          />
+          <Row
+            label="GPU"
+            value={
+              hardware?.hardware.gpu?.available
+                ? `${hardware.hardware.gpu.devices?.[0]?.name ?? hardware.hardware.gpu.vendor}${hardware.hardware.gpu.cuda ? " · CUDA" : ""}`
+                : "none — CPU encoding"
+            }
+          />
+          <Row label="Disk free" value={`${hardware?.hardware.disk?.free_gb ?? "?"} GB`} />
+          <Row
+            label="FFmpeg"
+            value={
+              status?.ffmpeg?.available
+                ? `${status.ffmpeg.version?.split(" ")[0] ?? "ready"}${status.ffmpeg.libass ? " · libass" : " · no libass (captions cannot be burned in)"}`
+                : "missing"
+            }
+          />
+          <Row label="Speech-to-text" value={status?.ai?.faster_whisper ? "faster-whisper" : "not installed"} />
+          <Row label="Local LLM" value={values.llm_enabled ? String(values.ollama_model ?? "enabled") : "disabled"} />
+          <Row label="Data folder" value={diagnostics?.paths?.data_dir ?? status?.data_dir ?? ""} mono />
+        </dl>
         {status?.notes?.length ? (
-          <ul className="mt-2 space-y-1 text-[11px] text-amber-glow">
+          <ul className="mt-3 space-y-1 border-t border-line pt-2">
             {status.notes.map((note, index) => (
-              <li key={index} title={note.detail}>
+              <li key={index} className="text-[11px] text-warn" title={note.detail}>
                 · {note.title}
               </li>
             ))}
           </ul>
         ) : null}
       </section>
+
+      <nav className="flex flex-wrap gap-1 border-b border-line">
+        {GROUPS.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            onClick={() => setActive(item.key)}
+            className={`-mb-px border-b-2 px-3 py-2 text-[13px] font-medium transition-colors ${
+              active === item.key ? "border-accent text-text" : "border-transparent text-text-3 hover:text-text-2"
+            }`}
+          >
+            {item.label}
+          </button>
+        ))}
+      </nav>
+
+      <section className="card p-4">
+        {group?.hint ? <p className="mb-3 text-xs text-text-3">{group.hint}</p> : null}
+        {shown.length === 0 ? (
+          <p className="text-xs text-text-3">Nothing here yet.</p>
+        ) : (
+          <div className="grid gap-3 md:grid-cols-2">
+            {shown.map((field) => (
+              <Field key={field.name} field={field} value={values[field.name] ?? field.value} onCommit={(value) => update(field, value)} />
+            ))}
+          </div>
+        )}
+        {busy ? <p className="mt-3 text-[11px] text-text-3">Saving…</p> : null}
+      </section>
+
+      {diagnostics?.errors?.length ? (
+        <section className="card p-4">
+          <h2 className="panel-title">Recent errors</h2>
+          <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto scroll-thin">
+            {diagnostics.errors.slice(0, 12).map((error, index) => (
+              <li key={index} className="text-[11px] text-text-3">
+                <span className="mono mr-2">{error.at?.slice(11, 19)}</span>
+                {error.message}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="flex gap-2">
+      <dt className="w-28 shrink-0 text-text-3">{label}</dt>
+      <dd className={`min-w-0 flex-1 truncate text-text-2 ${mono ? "mono text-[11px]" : ""}`} title={value}>
+        {value}
+      </dd>
     </div>
   );
 }
@@ -276,19 +279,13 @@ function Field({
 
   if (field.type === "boolean") {
     return (
-      <div className="flex items-center justify-between gap-3 rounded-lg border border-ink-700/70 p-3">
-        <div className="min-w-0">
-          <p className="text-xs font-semibold text-mist-200">{field.label}</p>
-          {field.help ? <p className="mt-0.5 text-[11px] text-mist-400">{field.help}</p> : null}
-        </div>
-        <button
-          type="button"
-          onClick={() => onCommit(!value)}
-          className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${value ? "bg-signal-500/80" : "bg-ink-600"}`}
-        >
-          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-mist-200 ${value ? "left-[1.15rem]" : "left-0.5"}`} />
-        </button>
-      </div>
+      <label className="flex items-center justify-between gap-3 rounded-md border border-line bg-surface-2 px-3 py-2">
+        <span className="min-w-0">
+          <span className="block text-[13px] font-medium text-text">{field.label}</span>
+          {field.help ? <span className="block truncate text-[11px] text-text-3">{field.help}</span> : null}
+        </span>
+        <input type="checkbox" className="h-4 w-4 accent-accent" checked={Boolean(value)} onChange={(event) => onCommit(event.target.checked)} />
+      </label>
     );
   }
 
@@ -304,44 +301,25 @@ function Field({
             </option>
           ))}
         </select>
-        {field.help ? <span className="mt-1 block text-[11px] text-mist-400">{field.help}</span> : null}
       </label>
     );
   }
 
   if (field.type === "number" || field.type === "integer") {
-    const min = field.ge ?? field.gt ?? 0;
-    const max = field.le ?? (min + (field.type === "integer" ? 100 : 10));
-    const step = field.type === "integer" ? 1 : (max - min) / 200;
     return (
       <label className="block">
-        <span className="label">
-          {field.label} · <span className="mono text-mist-300">{Number(draft).toFixed(field.type === "integer" ? 0 : 1)}</span>
-        </span>
+        <span className="label">{field.label}</span>
         <input
-          type="range"
-          min={min}
-          max={max}
-          step={step}
-          value={Number(draft) || min}
+          className="input"
+          type="number"
+          step={field.type === "integer" ? 1 : 0.1}
+          min={field.ge ?? field.gt}
+          max={field.le ?? field.lt}
+          value={Number(draft ?? 0)}
           onChange={(event) => setDraft(event.target.value)}
-          onMouseUp={() => onCommit(draft)}
-          onTouchEnd={() => onCommit(draft)}
-          className="w-full accent-flare-500"
+          onBlur={() => onCommit(draft)}
         />
-        {field.help ? <span className="mt-1 block text-[11px] text-mist-400">{field.help}</span> : null}
       </label>
-    );
-  }
-
-  if (field.type === "object") {
-    return (
-      <div className="rounded-lg border border-ink-700/70 p-3">
-        <p className="text-xs font-semibold text-mist-200">{field.label}</p>
-        <p className="mt-1 text-[11px] text-mist-400">
-          Configured from the caption editor on a clip (presets, fonts, colours, animation).
-        </p>
-      </div>
     );
   }
 
@@ -352,10 +330,10 @@ function Field({
         className="input"
         value={String(draft ?? "")}
         placeholder={field.default ? String(field.default) : ""}
+        spellCheck={false}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={() => onCommit(draft)}
       />
-      {field.help ? <span className="mt-1 block text-[11px] text-mist-400">{field.help}</span> : null}
     </label>
   );
 }

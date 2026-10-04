@@ -6,7 +6,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from ..media.download import parse_youtube_url
+from ..media.download import classify_url
+
+
+def caption_theme_patch(preset: str) -> dict[str, Any]:
+    """Map a caption preset name onto the caption theme it defines."""
+    from ..constants import CAPTION_PRESETS
+    from ..media.captions import preset_theme
+    from ..config import CaptionTheme
+
+    if not preset or preset not in CAPTION_PRESETS:
+        return {}
+    return {"caption": preset_theme(preset, CaptionTheme()).model_dump()}
 
 
 class ClipOptions(BaseModel):
@@ -19,7 +30,7 @@ class ClipOptions(BaseModel):
     min_score: float = Field(70.0, ge=0, le=100)
     max_clips: int = Field(0, ge=0, le=500, description="0 = unlimited")
     aspect_ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
-    caption_preset: str = "bold_creator"
+    caption_preset: str = "bold_creator"  # see constants.CAPTION_PRESETS
     layout: Literal["split", "podcast", "broll", "gameplay", "cinematic", "blur"] = "split"
     split_ratio: int = Field(65, ge=30, le=80)
     gameplay_enabled: bool = True
@@ -58,12 +69,14 @@ class ClipOptions(BaseModel):
             "translate_captions": self.translate_captions,
             "language_hint": self.language_hint,
             "llm_enabled": self.llm_enabled,
+            **caption_theme_patch(self.caption_preset),
         }
 
 
 class ProjectCreate(BaseModel):
-    url: str = Field("", description="YouTube URL")
+    url: str = Field("", description="Any video link: YouTube, a direct .mp4, or a site yt-dlp supports")
     title: str = ""
+    source_type: str = Field("", description="youtube | url | upload (inferred from the link when empty)")
     options: ClipOptions = Field(default_factory=ClipOptions)
     analyze: bool = True
     priority: int = 1
@@ -74,7 +87,7 @@ class ProjectCreate(BaseModel):
         text = (value or "").strip()
         if not text:
             return ""  # uploads create projects without a URL
-        parse_youtube_url(text)
+        classify_url(text)  # raises a friendly error for anything unusable
         return text
 
 
@@ -96,6 +109,7 @@ class ClipUpdate(BaseModel):
     layout: Literal["split", "podcast", "broll", "gameplay", "cinematic", "blur"] | None = None
     split_ratio: int | None = Field(None, ge=30, le=80)
     caption: dict[str, Any] | None = None
+    caption_preset: str | None = None
     captions_enabled: bool | None = None
     remove_silence: bool | None = None
     auto_zoom: bool | None = None

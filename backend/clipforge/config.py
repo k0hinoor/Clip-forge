@@ -22,7 +22,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .errors import invalid_input
 
@@ -238,7 +238,6 @@ class AppSettings(BaseModel):
     export_dir: str = ""      # empty = <data>/exports
     export_filename_template: str = "{project_slug}_{index:02d}_{title_slug}"
     auto_open_folder: bool = False
-    burn_captions: bool = True
 
     # --------------------------------------------------------- storage
     keep_source_video: bool = True
@@ -274,6 +273,20 @@ class AppSettings(BaseModel):
         if value not in {24, 25, 30, 50, 60}:
             raise ValueError("must be one of 24, 25, 30, 50, 60")
         return value
+
+    @model_validator(mode="after")
+    def _sync_size_to_ratio(self) -> "AppSettings":
+        """Keep the pixel size on the chosen aspect ratio.
+
+        ``aspect_ratio`` is what the user picks; ``output_width``/``output_height``
+        are the pixels. Without this, switching 9:16 -> 1:1 would keep 1080x1920
+        and the ratio would silently never change.
+        """
+        preset_width, preset_height = ASPECT_PRESETS[self.aspect_ratio]
+        width, height = int(self.output_width or 0), int(self.output_height or 0)
+        if width and height and abs(width / height - preset_width / preset_height) > 0.02:
+            self.output_width, self.output_height = preset_width, preset_height
+        return self
 
     # ------------------------------------------------------------- helpers
     def resolved_export_dir(self) -> Path:
@@ -350,8 +363,7 @@ SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "voice_gain_db", "music_enabled", "music_mood", "music_volume", "ducking", "ducking_db",
     ),
     "export": (
-        "export_dir", "export_filename_template", "auto_open_folder", "burn_captions",
-        "keep_source_audio",
+        "export_dir", "export_filename_template", "auto_open_folder", "keep_source_audio",
     ),
     "storage": (
         "keep_source_video", "cache_transcripts", "cache_downloads", "cleanup_days",

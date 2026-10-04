@@ -2,49 +2,48 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
-import {
-  Copy,
-  Download,
-  Eye,
-  Film,
-  Info,
-  Layers,
-  RefreshCw,
-  Rows3,
-  Save,
-  Sparkles,
-  Terminal,
-  Wand2,
-} from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowLeft, Download, Film, Loader2, Play } from "lucide-react";
 import { api } from "@/lib/api";
 import { useToast } from "@/components/Toast";
-import { Spinner } from "@/components/Progress";
-import { clock, duration, scoreTone, statusChip } from "@/lib/format";
+import { ProgressBar, Spinner } from "@/components/Progress";
+import { clock, duration, statusChip } from "@/lib/format";
 import type { ClipDetail } from "@/lib/types";
 
-const PRESETS = ["minimal", "cinematic", "bold_creator", "karaoke", "highlight", "documentary"];
-const LAYOUTS = ["split", "podcast", "broll", "gameplay", "cinematic", "blur"];
+const CAPTION_STYLES = [
+  ["bold_creator", "Bold (Shorts classic)"],
+  ["minimal", "Minimal"],
+  ["karaoke", "Karaoke"],
+  ["cinematic", "Cinematic"],
+  ["highlight", "Highlight"],
+  ["documentary", "Documentary"],
+];
+
+const LAYOUTS = [
+  ["podcast", "Full frame"],
+  ["blur", "Blurred background"],
+  ["cinematic", "Cinematic crop"],
+  ["split", "Split screen"],
+  ["gameplay", "Gameplay background"],
+  ["broll", "B-roll split"],
+];
 
 export default function ClipEditorPage() {
   const params = useParams<{ id: string; clipId: string }>();
   const { id: projectId, clipId } = params;
   const toast = useToast();
+  const video = useRef<HTMLVideoElement>(null);
 
   const [clip, setClip] = useState<ClipDetail | null>(null);
-  const [preview, setPreview] = useState<any>(null);
-  const [command, setCommand] = useState<string>("");
-  const [showCommand, setShowCommand] = useState(false);
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState({
     title: "",
     start: 0,
     end: 0,
-    layout: "split",
+    layout: "podcast",
     split_ratio: 65,
     caption_preset: "",
     captions_enabled: true,
-    zoom: true,
   });
 
   const load = useCallback(
@@ -52,16 +51,15 @@ export default function ClipEditorPage() {
       try {
         const detail = await api.clip(clipId);
         setClip(detail);
-        setDraft((current) => ({
-          ...current,
+        setDraft({
           title: detail.title,
           start: detail.start,
           end: detail.end,
-          layout: detail.plan?.layout ?? "split",
+          layout: detail.plan?.layout ?? "podcast",
           split_ratio: detail.plan?.split_ratio ?? 65,
           caption_preset: detail.captions?.theme?.preset ?? "",
-        }));
-        api.clipCommand(clipId).then((payload) => setCommand(payload.command)).catch(() => undefined);
+          captions_enabled: detail.captions ? detail.captions_enabled !== false : true,
+        });
       } catch (error) {
         if (!silent) toast.fail(error, "Could not open this clip.");
       }
@@ -71,6 +69,8 @@ export default function ClipEditorPage() {
 
   useEffect(() => {
     load();
+    const timer = window.setInterval(() => load(true), 5000);
+    return () => window.clearInterval(timer);
   }, [load]);
 
   const save = async () => {
@@ -82,9 +82,10 @@ export default function ClipEditorPage() {
         end: draft.end,
         layout: draft.layout,
         split_ratio: draft.split_ratio,
-        caption_preset: draft.caption_preset || undefined,
+        captions_enabled: draft.captions_enabled,
+        ...(draft.caption_preset ? { caption_preset: draft.caption_preset } : {}),
       });
-      toast.ok("Clip updated", "Captions, framing and the timeline were rebuilt from the transcript.");
+      toast.ok("Saved", "Captions, framing and pacing were rebuilt for this clip.");
       await load(true);
     } catch (error) {
       toast.fail(error, "Those edits could not be applied.");
@@ -93,23 +94,11 @@ export default function ClipEditorPage() {
     }
   };
 
-  const act = async (kind: "render" | "preview" | "regenerate" | "duplicate") => {
+  const render = async () => {
     setBusy(true);
     try {
-      if (kind === "render") {
-        await api.renderClip(clipId, { export: true });
-        toast.ok("Render queued");
-      } else if (kind === "preview") {
-        const result = await api.previewClip(clipId);
-        toast.ok("Preview queued", "A fast low-resolution render will appear in the queue.");
-        void result;
-      } else if (kind === "regenerate") {
-        const result = await api.regenerateClip(clipId);
-        toast.ok("Re-scored this moment", result.message ?? "The best boundaries were kept.");
-      } else {
-        await api.duplicateClip(clipId);
-        toast.ok("Clip duplicated");
-      }
+      await api.renderClip(clipId, { export: true });
+      toast.ok("Render queued", "It appears in the Queue as soon as a worker is free.");
       await load(true);
     } catch (error) {
       toast.fail(error);
@@ -118,34 +107,31 @@ export default function ClipEditorPage() {
     }
   };
 
-  const loadPreview = async (preset: string) => {
-    try {
-      const payload = await api.captionPreview(clipId, preset);
-      setPreview(payload);
-    } catch (error) {
-      toast.fail(error, "Caption preview failed.");
-    }
+  const markTime = (which: "start" | "end") => {
+    const current = video.current?.currentTime;
+    if (current === undefined) return;
+    // Player time is relative to the rendered clip; the stored trim is in source time.
+    const offset = clip?.start ?? 0;
+    const value = Number((offset + current).toFixed(2));
+    setDraft({ ...draft, [which]: value });
   };
 
   if (!clip) return <Spinner label="Loading clip…" />;
 
   const chip = statusChip(clip.status);
-  const timeline = clip.plan?.timeline;
-  const removedSeconds = timeline?.segments
-    ? Math.max(0, clip.duration - (timeline.segments[timeline.segments.length - 1]?.out_end ?? clip.duration))
-    : 0;
+  const captionLines = clip.captions?.lines ?? [];
 
   return (
     <div className="space-y-5">
       <header className="flex flex-wrap items-start gap-3">
         <div className="min-w-0 flex-1">
-          <Link href={`/projects/${projectId}`} className="text-[11px] font-semibold uppercase tracking-widest text-mist-400 hover:text-flare-400">
-            ← Project
+          <Link href={`/projects/${projectId}`} className="inline-flex items-center gap-1 text-xs text-text-3 hover:text-text-2">
+            <ArrowLeft size={12} /> Project
           </Link>
-          <h1 className="mt-1 text-xl font-black text-mist-200">
-            Clip {String(clip.index).padStart(2, "0")} · <span className={scoreTone(clip.score)}>{clip.score.toFixed(1)}</span>
+          <h1 className="mt-1 truncate text-lg font-semibold tracking-tight text-text">
+            Clip {String(clip.index).padStart(2, "0")}
           </h1>
-          <p className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-mist-400">
+          <p className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-text-3">
             <span className="mono">
               {clock(clip.start)}–{clock(clip.end)}
             </span>
@@ -155,86 +141,92 @@ export default function ClipEditorPage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button type="button" className="btn btn-ghost" onClick={() => act("preview")} disabled={busy}>
-            <Eye size={14} /> Preview
-          </button>
-          <button type="button" className="btn btn-ghost" onClick={() => act("regenerate")} disabled={busy}>
-            <RefreshCw size={14} /> Re-score
-          </button>
-          <button type="button" className="btn btn-ghost" onClick={() => act("duplicate")} disabled={busy}>
-            <Copy size={14} /> Duplicate
-          </button>
-          <button type="button" className="btn btn-primary" onClick={() => act("render")} disabled={busy}>
-            {busy ? <Spinner /> : <Film size={14} />} Render clip
+          <button type="button" className="btn btn-primary" onClick={render} disabled={busy}>
+            {busy ? <Loader2 size={14} className="animate-spin" /> : <Film size={14} />} Render
           </button>
         </div>
       </header>
 
-      <section className="grid gap-4 lg:grid-cols-[minmax(0,22rem)_1fr]">
+      <section className="grid gap-4 lg:grid-cols-[minmax(0,20rem)_1fr]">
         <div className="card overflow-hidden">
-          <div className="aspect-[9/16] bg-ink-900">
-            {clip.status === "rendered" ? (
-              <video className="h-full w-full" controls src={`/api/clips/${clipId}/preview`} />
+          <div className="aspect-[9/16]">
+            {clip.status === "rendered" || clip.has_preview ? (
+              <video ref={video} className="h-full w-full" controls preload="metadata" src={`/api/clips/${clipId}/preview`} />
             ) : (
-              <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-                <Film size={22} className="text-mist-400" />
-                <p className="text-xs text-mist-400">
+              <div className="flex h-full flex-col items-center justify-center gap-2 bg-surface-2 p-6 text-center">
+                <Play size={20} className="text-text-3" />
+                <p className="text-xs text-text-3">
                   {clip.status === "rendering" ? `Rendering · ${Math.round((clip.progress ?? 0) * 100)}%` : "Not rendered yet"}
                 </p>
+                {clip.status === "rendering" ? (
+                  <div className="w-2/3">
+                    <ProgressBar value={clip.progress ?? 0} />
+                  </div>
+                ) : null}
               </div>
             )}
           </div>
-          <div className="flex flex-wrap gap-2 border-t border-ink-700/70 p-3">
+          <div className="flex flex-wrap gap-2 border-t border-line p-3">
             {clip.status === "rendered" ? (
               <>
-                <a className="btn btn-ghost text-xs" href={`/api/clips/${clipId}/file?download=true`}>
-                  <Download size={13} /> Download MP4
+                <a className="btn btn-secondary btn-sm" href={`/api/clips/${clipId}/file?download=true`}>
+                  <Download size={13} /> MP4
                 </a>
-                <a className="btn btn-ghost text-xs" href={`/api/clips/${clipId}/captions/srt`}>
+                <a className="btn btn-ghost btn-sm" href={`/api/clips/${clipId}/captions/srt`}>
                   <Download size={13} /> SRT
                 </a>
               </>
-            ) : null}
-            <button type="button" className="btn btn-quiet text-xs" onClick={() => setShowCommand(!showCommand)}>
-              <Terminal size={13} /> {showCommand ? "Hide" : "Show"} FFmpeg command
-            </button>
+            ) : (
+              <span className="text-[11px] text-text-3">Render to get the MP4 and its SRT.</span>
+            )}
           </div>
         </div>
 
         <div className="space-y-4">
-          <section className="card p-4">
-            <h2 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-              <Sparkles size={15} className="text-amber-glow" /> WHY THIS CLIP?
-            </h2>
-            <p className="mt-2 text-sm italic leading-relaxed text-mist-300">“{clip.hook}”</p>
-            <ul className="mt-3 space-y-1.5">
-              {clip.why?.map((reason, index) => (
-                <li key={index} className="flex gap-2 text-xs leading-relaxed text-mist-300">
-                  <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-flare-500" />
-                  {reason}
-                </li>
-              ))}
-            </ul>
-            {clip.summary ? <p className="mt-3 text-xs leading-relaxed text-mist-400">{clip.summary}</p> : null}
-            {clip.factors ? (
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {Object.entries(clip.factors)
-                  .sort((a, b) => b[1] - a[1])
-                  .slice(0, 8)
-                  .map(([name, value]) => (
-                    <span key={name} className="chip" title={name}>
-                      {name.replace(/_/g, " ")} {(value as number).toFixed(2)}
-                    </span>
-                  ))}
+          <div className="card p-4">
+            <h2 className="panel-title">Trim</h2>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <span className="label">Start (s)</span>
+                <div className="flex gap-2">
+                  <input
+                    className="input"
+                    type="number"
+                    step="0.1"
+                    min={0}
+                    value={draft.start}
+                    onChange={(event) => setDraft({ ...draft, start: Number(event.target.value) })}
+                  />
+                  <button type="button" className="btn btn-secondary" onClick={() => markTime("start")} title="Use the player position">
+                    Here
+                  </button>
+                </div>
               </div>
-            ) : null}
-          </section>
+              <div>
+                <span className="label">End (s)</span>
+                <div className="flex gap-2">
+                  <input
+                    className="input"
+                    type="number"
+                    step="0.1"
+                    min={0}
+                    value={draft.end}
+                    onChange={(event) => setDraft({ ...draft, end: Number(event.target.value) })}
+                  />
+                  <button type="button" className="btn btn-secondary" onClick={() => markTime("end")} title="Use the player position">
+                    Here
+                  </button>
+                </div>
+              </div>
+            </div>
+            <p className="mt-2 text-[11px] text-text-3">
+              Length {duration(Math.max(0, draft.end - draft.start))} · “Here” reads the player position.
+            </p>
+          </div>
 
-          <section className="card space-y-4 p-4">
-            <h2 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-              <Layers size={15} /> Edit plan
-            </h2>
-            <div className="grid gap-3 sm:grid-cols-2">
+          <div className="card p-4">
+            <h2 className="panel-title">Look</h2>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
               <div>
                 <span className="label">Title</span>
                 <input className="input" value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} />
@@ -242,132 +234,108 @@ export default function ClipEditorPage() {
               <div>
                 <span className="label">Layout</span>
                 <select className="select" value={draft.layout} onChange={(event) => setDraft({ ...draft, layout: event.target.value })}>
-                  {LAYOUTS.map((layout) => (
-                    <option key={layout} value={layout}>
-                      {layout.replace(/_/g, " ")}
+                  {LAYOUTS.map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
                     </option>
                   ))}
                 </select>
               </div>
+              {["split", "broll", "gameplay"].includes(draft.layout) ? (
+                <div>
+                  <span className="label">Speaker share</span>
+                  <select
+                    className="select"
+                    value={draft.split_ratio}
+                    onChange={(event) => setDraft({ ...draft, split_ratio: Number(event.target.value) })}
+                  >
+                    {[50, 60, 65, 70].map((ratio) => (
+                      <option key={ratio} value={ratio}>
+                        {ratio} / {100 - ratio}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : null}
               <div>
-                <span className="label">Start (s)</span>
-                <input
-                  className="input"
-                  type="number"
-                  step="0.1"
-                  value={draft.start}
-                  onChange={(event) => setDraft({ ...draft, start: Number(event.target.value) })}
-                />
-              </div>
-              <div>
-                <span className="label">End (s)</span>
-                <input
-                  className="input"
-                  type="number"
-                  step="0.1"
-                  value={draft.end}
-                  onChange={(event) => setDraft({ ...draft, end: Number(event.target.value) })}
-                />
-              </div>
-              <div>
-                <span className="label">Split ratio (speaker share)</span>
-                <select
-                  className="select"
-                  value={draft.split_ratio}
-                  onChange={(event) => setDraft({ ...draft, split_ratio: Number(event.target.value) })}
-                >
-                  {[50, 60, 65, 70].map((ratio) => (
-                    <option key={ratio} value={ratio}>
-                      {ratio} / {100 - ratio}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <span className="label">Caption preset</span>
+                <span className="label">Caption style</span>
                 <select
                   className="select"
                   value={draft.caption_preset}
-                  onChange={(event) => {
-                    setDraft({ ...draft, caption_preset: event.target.value });
-                    loadPreview(event.target.value);
-                  }}
+                  disabled={!draft.captions_enabled}
+                  onChange={(event) => setDraft({ ...draft, caption_preset: event.target.value })}
                 >
                   <option value="">Project default</option>
-                  {PRESETS.map((preset) => (
-                    <option key={preset} value={preset}>
-                      {preset.replace(/_/g, " ")}
+                  {CAPTION_STYLES.map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
                     </option>
                   ))}
                 </select>
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-3">
+            <label className="mt-3 flex items-center gap-2 text-[13px] text-text-2">
+              <input
+                type="checkbox"
+                className="accent-accent"
+                checked={draft.captions_enabled}
+                onChange={(event) => setDraft({ ...draft, captions_enabled: event.target.checked })}
+              />
+              Burn captions into the video
+            </label>
+
+            <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-line pt-3">
               <button type="button" className="btn btn-primary" onClick={save} disabled={busy}>
-                <Save size={14} /> Save &amp; rebuild
+                Save changes
               </button>
-              <span className="text-[11px] text-mist-400">
-                Saving re-runs silence detection, framing and caption planning for this clip only.
-              </span>
+              <span className="text-[11px] text-text-3">Saving rebuilds pacing, framing and captions for this clip.</span>
             </div>
-          </section>
+          </div>
 
-          <section className="grid gap-4 sm:grid-cols-2">
-            <div className="card p-4">
-              <h3 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-                <Rows3 size={15} /> Pacing
-              </h3>
-              <p className="mt-2 text-xs text-mist-400">
-                {timeline?.segments?.length ?? 1} kept segment{(timeline?.segments?.length ?? 1) === 1 ? "" : "s"} · {removedSeconds.toFixed(1)}s of
-                silence removed
+          <div className="card p-4">
+            <h2 className="panel-title">Captions · {captionLines.length} lines</h2>
+            {captionLines.length === 0 ? (
+              <p className="mt-2 text-xs text-text-3">
+                {draft.captions_enabled
+                  ? "No words in this range yet — save the trim and the captions are rebuilt from the transcript."
+                  : "Captions are switched off for this clip."}
               </p>
-              <ul className="mt-2 space-y-0.5 text-[11px] text-mist-400">
-                {(timeline?.notes ?? []).map((note, index) => (
-                  <li key={index}>· {note}</li>
-                ))}
-                {(clip.plan?.notes ?? []).map((note, index) => (
-                  <li key={`p${index}`}>· {note}</li>
-                ))}
-              </ul>
-            </div>
-            <div className="card p-4">
-              <h3 className="flex items-center gap-2 text-sm font-bold text-mist-200">
-                <Info size={15} /> Assets
-              </h3>
-              <ul className="mt-2 space-y-1 text-[11px] text-mist-400">
-                <li>Gameplay: {clip.plan?.gameplay?.name ?? "none selected"}</li>
-                <li>B-roll: {clip.plan?.broll?.name ?? "none selected"}</li>
-                <li>Music: {clip.plan?.music?.name ?? "no music track"}</li>
-                <li>
-                  Reframing: {clip.plan?.crop ? `${clip.plan.crop.mode ?? "static"} · ${clip.plan.crop.crop?.join("×") ?? ""}` : "full frame"}
-                </li>
-              </ul>
-            </div>
-          </section>
-
-          {preview ? (
-            <section className="card p-4">
-              <h3 className="text-sm font-bold text-mist-200">Caption preview · {preview.theme?.preset}</h3>
-              <ol className="mt-2 space-y-1.5">
-                {preview.lines?.slice(0, 8).map((line: any) => (
-                  <li key={line.index} className="mono text-xs text-mist-200">
-                    <span className="mr-2 text-mist-400">{clock(line.start)}</span>
-                    {line.text}
+            ) : (
+              <ol className="mt-2 max-h-56 space-y-1 overflow-y-auto scroll-thin">
+                {captionLines.map((line: any) => (
+                  <li key={line.index} className="flex gap-3 text-xs">
+                    <span className="mono shrink-0 text-text-3">{clock(line.start)}</span>
+                    <span className="text-text-2">{line.text}</span>
                   </li>
                 ))}
               </ol>
-            </section>
-          ) : null}
+            )}
+          </div>
 
-          {showCommand ? (
-            <section className="card p-4">
-              <h3 className="text-sm font-bold text-mist-200">FFmpeg command</h3>
-              <pre className="mono mt-2 max-h-52 overflow-auto rounded-lg bg-ink-950/80 p-3 text-[10px] leading-relaxed text-mist-300 scroll-thin">
-                {command || "unavailable"}
-              </pre>
-            </section>
-          ) : null}
+          <div className="card p-4">
+            <h2 className="panel-title">Why this moment</h2>
+            <p className="mt-2 text-[13px] italic leading-relaxed text-text-2">“{clip.hook}”</p>
+            {clip.why?.length ? (
+              <ul className="mt-2 space-y-1">
+                {clip.why.map((reason, index) => (
+                  <li key={index} className="flex gap-2 text-xs leading-relaxed text-text-3">
+                    <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-text-3" />
+                    {reason}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {clip.plan?.notes?.length ? (
+              <ul className="mt-3 space-y-1 border-t border-line pt-2">
+                {clip.plan.notes.map((note: string, index: number) => (
+                  <li key={index} className="text-[11px] text-text-3">
+                    · {note}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
         </div>
       </section>
     </div>

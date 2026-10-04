@@ -24,16 +24,46 @@ log = get_logger(__name__)
 
 @router.post("", status_code=201)
 def create_project(payload: ProjectCreate):
-    """Create a project from a YouTube URL and (by default) start analysing it."""
+    """Create a project from any video link and (by default) start analysing it."""
     if not payload.url:
         raise ClipForgeError(
             code=ErrorCode.INVALID_URL,
-            message="A YouTube URL is required.",
-            hint="Paste a watch/share URL, or upload a file with POST /api/projects/upload.",
+            message="A video link is required.",
+            hint="Paste a YouTube, Vimeo or direct .mp4 link - or upload a file with POST /api/projects/upload.",
             status_code=422,
         )
+
+    # A link that points at a file on this machine is imported, not downloaded.
+    local = Path(payload.url).expanduser()
+    if local.is_file():
+        from ...media.download import ALLOWED_UPLOAD_EXTENSIONS
+
+        if local.suffix.lower() not in ALLOWED_UPLOAD_EXTENSIONS:
+            raise ClipForgeError(
+                code=ErrorCode.UNSUPPORTED_FORMAT,
+                message=f"{local.suffix or 'That file type'} cannot be analysed.",
+                hint="Supported: " + ", ".join(sorted(ALLOWED_UPLOAD_EXTENSIONS)),
+                status_code=422,
+            )
+        project = project_service.create_project(
+            title=payload.title or local.stem,
+            source_type="upload",
+            options=payload.options.to_settings_patch(),
+            source_path=local,
+        )
+        job = manager().enqueue_analysis(project["id"], priority=payload.priority) if payload.analyze else None
+        return {"project": project, "job": job}
+
+    from ...media.download import classify_url
+
+    source = classify_url(payload.url)
     options = payload.options.to_settings_patch()
-    project = project_service.create_project(url=payload.url, title=payload.title, options=options)
+    project = project_service.create_project(
+        url=source.url,
+        title=payload.title,
+        source_type=payload.source_type or ("youtube" if source.is_youtube else "url"),
+        options=options,
+    )
     job = None
     if payload.analyze:
         job = manager().enqueue_analysis(project["id"], priority=payload.priority)
@@ -47,7 +77,7 @@ async def upload_project(
     options: str = Form(""),
     analyze: str = Form("true"),
 ):
-    """Analyse a local file instead of a YouTube URL."""
+    """Analyse a local file instead of a link."""
     settings = get_settings()
     if not settings.uploads_enabled:
         raise ClipForgeError(

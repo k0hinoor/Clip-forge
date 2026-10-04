@@ -95,20 +95,38 @@ class ProjectPaths:
 
     @classmethod
     def for_project(cls, project: Project) -> "ProjectPaths":
-        return cls.for_snapshot({"id": project.id, "title": project.title})
+        return cls.for_snapshot({"id": project.id, "title": project.title, "paths": project.paths})
 
     @classmethod
     def for_snapshot(cls, snapshot: dict[str, Any]) -> "ProjectPaths":
+        """Resolve the on-disk layout for a project.
+
+        The stored layout wins. The folder name contains the title, and the real
+        title only arrives with the video metadata - so deriving it from the
+        current title would point at a different (empty) folder and every later
+        step would report "the source video is missing".
+        """
+        stored = snapshot.get("paths") or {}
         base = Env.DATA_DIR / "projects" / f"{slugify(str(snapshot.get('title') or 'project'), max_length=40)}_{snapshot.get('id')}"
+        stored_root = str(stored.get("root") or "")
+        if stored_root:
+            candidate = Path(stored_root)
+            if candidate.is_absolute() and candidate.exists():
+                base = candidate
+
+        def folder(key: str, default: Path) -> Path:
+            value = str(stored.get(key) or "")
+            return Path(value) if value else default
+
         return cls(
             root=base,
-            source=base / "source",
-            audio=base / "audio",
-            transcript=base / "transcript",
-            analysis=base / "analysis",
-            clips=base / "clips",
-            renders=base / "renders",
-            metadata=base / "metadata",
+            source=folder("source", base / "source"),
+            audio=folder("audio", base / "audio"),
+            transcript=folder("transcript", base / "transcript"),
+            analysis=folder("analysis", base / "analysis"),
+            clips=folder("clips", base / "clips"),
+            renders=folder("renders", base / "renders"),
+            metadata=folder("metadata", base / "metadata"),
         )
 
     def ensure(self) -> "ProjectPaths":

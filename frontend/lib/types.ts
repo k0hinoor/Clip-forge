@@ -77,16 +77,20 @@ export interface LogLine {
 export interface StageState {
   key: string;
   label: string;
-  status: "pending" | "active" | "done" | "failed" | "skipped";
+  /** The pipeline reports `state`; older payloads used `status`. */
+  state?: "pending" | "running" | "done" | "failed";
+  status?: "pending" | "active" | "done" | "failed" | "skipped";
+  detail?: string;
   progress: number;
-  message: string;
+  message?: string;
+  weight?: number;
 }
 
 export interface ProjectStatus {
-  project: ProjectSummary;
+  project: ProjectSummary & { word_count?: number; speakers?: number; clip_count?: number };
+  job: Job | null;
   stages: StageState[];
-  queue: QueueState;
-  message?: string;
+  clips: { total: number; rendered: number; failed: number; pending: number; queued: number; rendering: number };
 }
 
 export interface QueueState {
@@ -182,6 +186,8 @@ export interface Candidate {
 }
 
 export interface ClipDetail extends ClipSummary {
+  captions_enabled?: boolean;
+  has_preview?: boolean;
   plan: {
     layout: LayoutMode;
     split_ratio: number;
@@ -201,8 +207,13 @@ export interface ClipDetail extends ClipSummary {
 }
 
 export interface CaptionPlan {
-  lines: { index: number; text: string; start: number; end: number; words: TranscriptWord[] }[];
-  theme: Record<string, any>;
+  lines: { index: number; text: string; start: number; end: number; words: { text: string; start: number; end: number }[] }[];
+  /** The full style behind the preset, so the editor can show what is active. */
+  theme?: { preset?: string; [key: string]: unknown };
+  preset?: string;
+  animation?: string;
+  word_count?: number;
+  line_count?: number;
   language: string;
   font: string;
   notes: string[];

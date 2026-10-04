@@ -81,12 +81,19 @@ export const api = {
   logs: (name: string, lines = 300) => request<{ name: string; lines: string[] }>(`/api/system/logs?name=${name}&lines=${lines}`),
   errors: (limit = 30) => request<{ errors: any[] }>(`/api/system/errors?limit=${limit}`),
   capabilities: () => request<any>("/api/system/capabilities"),
-  probeYoutube: (url: string) => request<any>("/api/system/youtube/probe", json({ url })),
+  probe: (url: string) => request<any>("/api/system/probe", json({ url })),
   testOllama: (base_url: string, model: string) => request<any>("/api/system/ollama/test", json({ base_url, model })),
   ollamaModels: (base_url = "") => request<{ models: string[]; error?: string }>(`/api/system/ollama/models?base_url=${encodeURIComponent(base_url)}`),
 
   // -------------------------------------------------------------- settings
-  settings: () => request<{ settings: Record<string, any> }>("/api/settings"),
+  settings: () =>
+    request<{
+      settings: Record<string, any>;
+      schema: Record<string, SettingsSchemaField>;
+      sections: Record<string, any>;
+      paths: Record<string, string>;
+      caption_presets: Record<string, any>;
+    }>("/api/settings"),
   settingsSchema: () =>
     request<{ schema: Record<string, SettingsSchemaField>; sections: Record<string, string> }>("/api/settings/schema"),
   updateSettings: (patch: Record<string, unknown>) => request<{ settings: Record<string, any> }>("/api/settings", { ...json(patch), method: "PUT" }),

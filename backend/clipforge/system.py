@@ -517,7 +517,14 @@ def diagnostics() -> dict[str, Any]:
         "logs": log_file_paths(),
         "ffmpeg": ffmpeg.to_dict(),
         "ai": stack,
-        "errors": recent_errors(30),
+        "errors": [
+            {
+                "at": str(error.get("ts") or error.get("time") or ""),
+                "logger": str(error.get("file") or error.get("logger") or ""),
+                "message": str(error.get("message") or error.get("event") or ""),
+            }
+            for error in recent_errors(30)
+        ],
         "python": sys.version,
         "platform": platform.platform(),
     }
