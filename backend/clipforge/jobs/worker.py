@@ -182,9 +182,11 @@ class Worker(threading.Thread):
                 result = run_job(job, worker_name=self.name)
                 if job_queue.is_cancelled(job["id"]):
                     job_queue.mark_cancelled(job["id"])
+                    _settle_project(job)
                     BUS.publish("job.cancelled", {"job_id": job["id"]}, project_id=job.get("project_id", ""), job_id=job["id"])
                 else:
                     job_queue.finish(job["id"], {**result, "duration_seconds": round(time.time() - started, 2)})
+                    _settle_project(job)
                     BUS.publish(
                         "job.finished",
                         {"job_id": job["id"], "kind": job["kind"], "result": result, "duration": round(time.time() - started, 2)},
@@ -222,6 +224,31 @@ class Worker(threading.Thread):
                 self.current_job = ""
                 media_runner.kill_all()
         log.debug("%s stopped", self.name)
+
+
+def _settle_project(job: dict[str, Any]) -> None:
+    """Reset a project left `running` by a clip job's progress reports.
+
+    The analyse pipeline writes its own final state; render jobs only ever
+    push progress, so without this the project card stays stuck on the last
+    render stage (e.g. "generating a thumbnail") forever.
+    """
+    project_id = job.get("project_id")
+    if not project_id or job.get("kind") == "analyze":
+        return
+    with session_scope() as session:
+        project = session.get(Project, project_id)
+        if project is None or project.status not in {"running", "queued"}:
+            return
+        project.status = "ready"
+        project.stage = "ready"
+        project.status_message = "ready"
+        BUS.publish(
+            "project.updated",
+            {"project_id": project_id, "status": "ready", "stage": "ready"},
+            project_id=project_id,
+            job_id=job.get("id", ""),
+        )
 
 
 def _mark_clip_failed(job: dict[str, Any], error: ClipForgeError) -> None:
