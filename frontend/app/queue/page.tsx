@@ -1,26 +1,27 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { Ban, ListVideo, Play, RotateCcw, Trash2 } from "lucide-react";
-import { api, subscribeEvents } from "@/lib/api";
+import { Ban, ListVideo, RotateCcw, Trash2 } from "lucide-react";
+import { api } from "@/lib/api";
+import { useLiveRefresh } from "@/lib/live";
 import { useToast } from "@/components/Toast";
 import { ProgressBar } from "@/components/Progress";
-import { when } from "@/lib/format";
+import { jobLabel, statusChip, when } from "@/lib/format";
 import type { Job, QueueState } from "@/lib/types";
 
 export default function QueuePage() {
   const toast = useToast();
   const [queue, setQueue] = useState<QueueState | null>(null);
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(
     async (silent = false) => {
       try {
-        const [queuePayload, jobPayload] = await Promise.all([api.queue(), api.jobs(150)]);
-        setQueue(queuePayload.queue);
-        setJobs(jobPayload.jobs);
+        const payload = await api.queue();
+        setQueue(payload.queue);
       } catch (error) {
-        if (!silent) toast.fail(error, "Could not read the render queue.");
+        if (!silent) toast.fail(error, "Could not read the queue.");
       }
     },
     [toast],
@@ -28,30 +29,32 @@ export default function QueuePage() {
 
   useEffect(() => {
     load();
-    const timer = window.setInterval(() => load(true), 3000);
-    const unsubscribe = subscribeEvents(() => load(true));
-    return () => {
-      window.clearInterval(timer);
-      unsubscribe();
-    };
   }, [load]);
 
-  const act = async (kind: "cancel" | "retry" | "retryFailed" | "purge", jobId = "") => {
+  useLiveRefresh(() => load(true), { match: (event) => event.type.startsWith("job."), throttleMs: 1000, intervalMs: 10000 });
+
+  const act = async <T,>(action: () => Promise<T>, done: string | ((result: T) => string)) => {
+    setBusy(true);
     try {
-      if (kind === "cancel") await api.cancelJob(jobId);
-      if (kind === "retry") await api.retryJob(jobId);
-      if (kind === "retryFailed") await api.retryFailed();
-      if (kind === "purge") await api.purgeJobs();
-      toast.ok("Done");
+      const result = await action();
+      toast.ok(typeof done === "function" ? done(result) : done);
       await load(true);
     } catch (error) {
       toast.fail(error);
+    } finally {
+      setBusy(false);
     }
   };
 
   const counts = queue?.counts;
-  const finished = jobs.filter((job) => ["succeeded", "failed", "cancelled"].includes(job.status));
-  const rows = [...(queue?.running ?? []), ...(queue?.queued ?? []), ...finished];
+  const sections: { title: string; jobs: Job[] }[] = [
+    { title: "Running", jobs: queue?.running ?? [] },
+    { title: "Waiting", jobs: queue?.queued ?? [] },
+    { title: "Failed", jobs: queue?.failed ?? [] },
+    { title: "Cancelled", jobs: queue?.cancelled ?? [] },
+    { title: "Finished", jobs: queue?.recent ?? [] },
+  ].filter((section) => section.jobs.length);
+  const finished = (queue?.recent.length ?? 0) + (queue?.cancelled.length ?? 0);
 
   return (
     <div className="space-y-4">
@@ -62,60 +65,98 @@ export default function QueuePage() {
             {counts ? `${counts.running} running · ${counts.queued} waiting · ${counts.failed} failed` : "loading…"}
           </p>
         </div>
-        <button type="button" className="btn btn-secondary" onClick={() => act("retryFailed")} disabled={!counts?.failed}>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={() => act(() => api.retryFailed(), (result) => `${result.retried} job${result.retried === 1 ? "" : "s"} re-queued`)}
+          disabled={busy || !counts?.failed}
+        >
           <RotateCcw size={14} /> Retry failed
         </button>
-        <button type="button" className="btn btn-ghost" onClick={() => act("purge")}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => act(() => api.purgeJobs(), "Finished jobs cleared")}
+          disabled={busy || finished === 0}
+          title="Remove finished and cancelled jobs from the list (failed ones stay)"
+        >
           <Trash2 size={14} /> Clear finished
         </button>
       </header>
 
-      {rows.length === 0 ? (
+      {sections.length === 0 ? (
         <div className="card flex flex-col items-center gap-1 px-6 py-12 text-center">
           <ListVideo size={20} className="text-text-3" />
-          <p className="mt-1 text-sm font-medium text-text-2">The queue is empty</p>
-          <p className="max-w-sm text-xs text-text-3">
-            Queue clips from a project and they render here one after another, in the background.
-          </p>
+          <p className="mt-1 text-sm font-medium text-text-2">{queue ? "The queue is empty" : "Loading…"}</p>
+          <p className="max-w-sm text-xs text-text-3">Analyses and renders run here in the background, one after another.</p>
         </div>
       ) : (
-        <ul className="card divide-y divide-line overflow-hidden">
-          {rows.map((job) => (
-            <li key={job.id} className="px-4 py-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="chip">{job.kind.replace(/_/g, " ")}</span>
-                <span className="min-w-0 flex-1 truncate text-[13px] text-text">{job.label || job.message || job.id}</span>
-                <span className="mono text-[11px] text-text-3">{when(job.created_at)}</span>
-                {["queued", "running"].includes(job.status) ? (
-                  <button type="button" className="btn btn-ghost btn-icon" onClick={() => act("cancel", job.id)} aria-label="Cancel job">
-                    <Ban size={14} />
-                  </button>
-                ) : (
-                  <button type="button" className="btn btn-ghost btn-icon" onClick={() => act("retry", job.id)} aria-label="Retry job">
-                    <Play size={14} />
-                  </button>
-                )}
-              </div>
-
-              {job.status === "running" ? (
-                <div className="mt-2 flex items-center gap-2">
-                  <ProgressBar value={job.progress} className="max-w-xs" />
-                  <span className="truncate text-[11px] text-text-3">
-                    {Math.round(job.progress * 100)}% · {job.stage || "working"}
-                  </span>
-                </div>
-              ) : null}
-
-              {job.error_message ? (
-                <p className="mt-1.5 text-[11px] text-bad">
-                  {job.error_message}
-                  {job.error_hint ? <span className="text-text-3"> — {job.error_hint}</span> : null}
-                </p>
-              ) : null}
-            </li>
-          ))}
-        </ul>
+        sections.map((section) => (
+          <section key={section.title} className="space-y-1.5">
+            <h2 className="panel-title">
+              {section.title} · {section.jobs.length}
+            </h2>
+            <ul className="card divide-y divide-line overflow-hidden">
+              {section.jobs.map((job) => (
+                <JobRow
+                  key={job.id}
+                  job={job}
+                  disabled={busy}
+                  onCancel={() => act(() => api.cancelJob(job.id), "Cancelling")}
+                  onRetry={() => act(() => api.retryJob(job.id), "Re-queued")}
+                />
+              ))}
+            </ul>
+          </section>
+        ))
       )}
     </div>
+  );
+}
+
+function JobRow({ job, disabled, onCancel, onRetry }: { job: Job; disabled: boolean; onCancel: () => void; onRetry: () => void }) {
+  const chip = statusChip(job.status);
+  const href = job.clip_id ? `/projects/${job.project_id}/clips/${job.clip_id}` : job.project_id ? `/projects/${job.project_id}` : "";
+  const label = jobLabel(job);
+  return (
+    <li className="px-4 py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={chip.className}>{chip.label}</span>
+        {href ? (
+          <Link href={href} className="min-w-0 flex-1 truncate text-[13px] text-text hover:text-accent">
+            {label}
+          </Link>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[13px] text-text">{label}</span>
+        )}
+        {job.project_title && job.clip_id ? <span className="hidden truncate text-[11px] text-text-3 sm:inline">{job.project_title}</span> : null}
+        <span className="mono text-[11px] text-text-3">{when(job.finished_at || job.started_at || job.created_at)}</span>
+        {job.status === "queued" || job.status === "running" ? (
+          <button type="button" className="btn btn-ghost btn-icon" onClick={onCancel} disabled={disabled || job.cancel_requested} aria-label="Cancel job">
+            <Ban size={14} />
+          </button>
+        ) : job.status === "failed" || job.status === "cancelled" ? (
+          <button type="button" className="btn btn-ghost btn-icon" onClick={onRetry} disabled={disabled} aria-label="Retry job">
+            <RotateCcw size={14} />
+          </button>
+        ) : null}
+      </div>
+
+      {job.status === "running" ? (
+        <div className="mt-2 flex items-center gap-2">
+          <ProgressBar value={job.progress} className="max-w-xs" />
+          <span className="truncate text-[11px] text-text-3">
+            {Math.round(job.progress * 100)}% · {job.cancel_requested ? "cancelling…" : job.message || job.stage || "working"}
+          </span>
+        </div>
+      ) : null}
+
+      {job.status === "failed" && job.error?.message ? (
+        <p className="mt-1.5 text-[11px] text-bad">
+          {job.error.message}
+          {job.error.hint ? <span className="text-text-3"> — {job.error.hint}</span> : null}
+        </p>
+      ) : null}
+    </li>
   );
 }

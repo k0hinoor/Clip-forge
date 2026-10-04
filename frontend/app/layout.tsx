@@ -1,11 +1,12 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { Shell } from "@/components/Shell";
+import { SystemProvider } from "@/components/System";
 import { ToastProvider } from "@/components/Toast";
 
 export const metadata: Metadata = {
   title: "CLIPFORGE AI",
-  description: "Local AI clipping studio: long videos in, vertical shorts out. Everything runs on this machine.",
+  description: "AI clipping studio: long videos in, captioned vertical shorts out.",
 };
 
 export const viewport: Viewport = {
@@ -19,7 +20,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <ToastProvider>
-          <Shell>{children}</Shell>
+          <SystemProvider>
+            <Shell>{children}</Shell>
+          </SystemProvider>
         </ToastProvider>
       </body>
     </html>

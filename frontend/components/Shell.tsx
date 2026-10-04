@@ -2,10 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
-import { Film, FolderOpen, ListVideo, Settings, SlidersHorizontal } from "lucide-react";
-import { api } from "@/lib/api";
-import type { SystemStatus } from "@/lib/types";
+import { Film, FolderOpen, ListVideo, Settings, SlidersHorizontal, WifiOff } from "lucide-react";
+import { useSystem } from "@/components/System";
 
 const NAV = [
   { href: "/", label: "Studio", icon: SlidersHorizontal },
@@ -16,22 +14,7 @@ const NAV = [
 
 export function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const [status, setStatus] = useState<SystemStatus | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    const load = () =>
-      api
-        .status()
-        .then((value) => alive && setStatus(value))
-        .catch(() => alive && setStatus(null));
-    load();
-    const timer = window.setInterval(load, 20000);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
-  }, []);
+  const { status, offline } = useSystem();
 
   const busy = (status?.queue?.queued ?? 0) + (status?.queue?.running ?? 0);
 
@@ -68,7 +51,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <div className="space-y-1 border-t border-line pt-3 text-[11px] text-text-3">
           <p className="flex items-center gap-1.5">
             <Film size={12} />
-            {status?.ffmpeg?.available ? `FFmpeg ${status.ffmpeg.version?.split(" ")[0] ?? "ready"}` : "FFmpeg missing"}
+            {status ? (status.ffmpeg?.available ? `FFmpeg ${status.ffmpeg.version?.split(" ")[0] ?? "ready"}` : "FFmpeg missing") : "connecting…"}
           </p>
           <p className="truncate" title={status?.data_dir ?? ""}>
             {status?.data_dir ? status.data_dir.split(/[\\/]/).slice(-2).join("/") : "—"}
@@ -93,6 +76,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
             })}
           </nav>
         </header>
+        {offline ? (
+          <div role="status" className="flex items-center gap-2 border-b border-bad/40 bg-bad/10 px-4 py-2 text-xs text-bad">
+            <WifiOff size={13} />
+            The CLIPFORGE backend is not reachable. Changes cannot be saved until it is back.
+          </div>
+        ) : null}
         <div className="mx-auto w-full max-w-5xl px-4 py-6 md:px-6">{children}</div>
       </main>
     </div>

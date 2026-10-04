@@ -4,10 +4,12 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, Link2, Loader2, Plus, Trash2, Upload } from "lucide-react";
 import { api } from "@/lib/api";
+import { useLiveRefresh } from "@/lib/live";
+import { CaptionStyleSelect, LAYOUT_OPTIONS, Toggle } from "@/components/Controls";
 import { useToast } from "@/components/Toast";
 import { ProgressBar } from "@/components/Progress";
-import { clock, statusChip, when } from "@/lib/format";
-import type { ProjectSummary } from "@/lib/types";
+import { clock, isAnalysing, statusChip, when } from "@/lib/format";
+import type { CaptionPresetInfo, ProjectSummary } from "@/lib/types";
 
 const LENGTHS: Record<string, { min: number; target: number; max: number; label: string }> = {
   short: { min: 15, target: 25, max: 30, label: "Short · 15–30 s" },
@@ -22,55 +24,102 @@ const RATIOS = [
   ["16:9", "16:9 landscape"],
 ];
 
-const LAYOUTS = [
-  ["podcast", "Full frame"],
-  ["blur", "Blurred background"],
-  ["cinematic", "Cinematic crop"],
-  ["split", "Split screen"],
-  ["gameplay", "Gameplay background"],
-  ["broll", "B-roll split"],
-];
+const ACCEPTED_VIDEO = "video/*,.mp4,.mov,.mkv,.webm,.m4v,.avi";
 
-const CAPTION_STYLES = [
-  ["bold_creator", "Bold (Shorts classic)"],
-  ["minimal", "Minimal"],
-  ["karaoke", "Karaoke"],
-  ["cinematic", "Cinematic"],
-  ["highlight", "Highlight"],
-  ["documentary", "Documentary"],
-];
+type Options = {
+  aspect_ratio: string;
+  caption_preset: string;
+  layout: string;
+  remove_silence: boolean;
+  auto_zoom: boolean;
+  captions_enabled: boolean;
+  min_score: number;
+  clip_mode: string;
+  translate_captions: boolean;
+  llm_enabled: boolean;
+  min_clip_seconds: number;
+  target_clip_seconds: number;
+  max_clip_seconds: number;
+};
+
+const FALLBACK_OPTIONS: Options = {
+  aspect_ratio: "9:16",
+  caption_preset: "bold_creator",
+  layout: "split",
+  remove_silence: true,
+  auto_zoom: true,
+  captions_enabled: true,
+  min_score: 70,
+  clip_mode: "balanced",
+  translate_captions: false,
+  llm_enabled: true,
+  min_clip_seconds: 35,
+  target_clip_seconds: 60,
+  max_clip_seconds: 75,
+};
+
+function optionsFromSettings(settings: Record<string, any>): Options {
+  const pick = <K extends keyof Options>(key: K): Options[K] => (settings[key] ?? FALLBACK_OPTIONS[key]) as Options[K];
+  return {
+    aspect_ratio: pick("aspect_ratio"),
+    caption_preset: settings.caption?.preset ?? FALLBACK_OPTIONS.caption_preset,
+    layout: pick("layout"),
+    remove_silence: pick("remove_silence"),
+    auto_zoom: pick("auto_zoom"),
+    captions_enabled: pick("captions_enabled"),
+    min_score: pick("min_score"),
+    clip_mode: pick("clip_mode"),
+    translate_captions: pick("translate_captions"),
+    llm_enabled: pick("llm_enabled"),
+    min_clip_seconds: pick("min_clip_seconds"),
+    target_clip_seconds: pick("target_clip_seconds"),
+    max_clip_seconds: pick("max_clip_seconds"),
+  };
+}
+
+function lengthKeyFor(options: Options): string {
+  const match = Object.entries(LENGTHS).find(
+    ([key, preset]) =>
+      key !== "custom" &&
+      preset.min === options.min_clip_seconds &&
+      preset.target === options.target_clip_seconds &&
+      preset.max === options.max_clip_seconds,
+  );
+  return match ? match[0] : "custom";
+}
 
 export default function StudioPage() {
   const toast = useToast();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [advanced, setAdvanced] = useState(false);
   const [lengthKey, setLengthKey] = useState("standard");
+  const [uploadsEnabled, setUploadsEnabled] = useState(true);
+  const [presets, setPresets] = useState<Record<string, CaptionPresetInfo>>({});
   const fileInput = useRef<HTMLInputElement>(null);
 
-  const [options, setOptions] = useState({
-    aspect_ratio: "9:16",
-    caption_preset: "bold_creator",
-    layout: "podcast",
-    split_ratio: 65,
-    remove_silence: true,
-    auto_zoom: true,
-    captions_enabled: true,
-    min_score: 70,
-    clip_mode: "balanced",
-    translate_captions: false,
-    llm_enabled: true,
-    min_clip_seconds: 35,
-    target_clip_seconds: 60,
-    max_clip_seconds: 75,
-  });
+  // The form starts from the saved Settings; only what the user changes here is
+  // sent with the project, everything else keeps following Settings.
+  const [options, setOptions] = useState<Options>(FALLBACK_OPTIONS);
+  const [touched, setTouched] = useState<Set<keyof Options>>(new Set());
+
+  const change = (patch: Partial<Options>) => {
+    setOptions((current) => ({ ...current, ...patch }));
+    setTouched((current) => new Set([...current, ...(Object.keys(patch) as (keyof Options)[])]));
+  };
+
+  const chosenOptions = (): Record<string, unknown> =>
+    Object.fromEntries([...touched].map((key) => [key, options[key]]));
 
   const load = useCallback(
     async (silent = false) => {
       try {
         const list = await api.projects();
         setProjects(list.projects);
+        setLoaded(true);
       } catch (error) {
         if (!silent) toast.fail(error, "Could not load your projects.");
       }
@@ -80,19 +129,28 @@ export default function StudioPage() {
 
   useEffect(() => {
     load();
-    const timer = window.setInterval(() => load(true), 6000);
-    return () => window.clearInterval(timer);
+    api
+      .settings()
+      .then((payload) => {
+        const initial = optionsFromSettings(payload.settings);
+        setOptions(initial);
+        setLengthKey(lengthKeyFor(initial));
+        setUploadsEnabled(payload.settings.uploads_enabled !== false);
+        setPresets(payload.caption_presets ?? {});
+      })
+      .catch(() => undefined); // the form still works with the defaults
   }, [load]);
+
+  useLiveRefresh(() => load(true), {
+    match: (event) => /^(project|job)\./.test(event.type),
+    throttleMs: 1500,
+    intervalMs: 10000,
+  });
 
   const applyLength = (key: string) => {
     setLengthKey(key);
     const preset = LENGTHS[key];
-    setOptions((current) => ({
-      ...current,
-      min_clip_seconds: preset.min,
-      target_clip_seconds: preset.target,
-      max_clip_seconds: preset.max,
-    }));
+    change({ min_clip_seconds: preset.min, target_clip_seconds: preset.target, max_clip_seconds: preset.max });
   };
 
   const submit = async () => {
@@ -103,7 +161,7 @@ export default function StudioPage() {
     }
     setBusy(true);
     try {
-      const result = await api.createProject({ url: link, options });
+      const result = await api.createProject({ url: link, options: chosenOptions() });
       toast.ok("Analysis started", result.project.title);
       setUrl("");
       await load(true);
@@ -116,14 +174,16 @@ export default function StudioPage() {
 
   const upload = async (file: File) => {
     setBusy(true);
+    setUploadProgress(0);
     try {
-      await api.uploadProject(file, options, file.name.replace(/\.[^.]+$/, ""));
-      toast.ok("Upload received", file.name);
+      await api.uploadProject(file, chosenOptions(), file.name.replace(/\.[^.]+$/, ""), setUploadProgress);
+      toast.ok("Upload received — analysis queued", file.name);
       await load(true);
     } catch (error) {
       toast.fail(error, "The upload could not be processed.");
     } finally {
       setBusy(false);
+      setUploadProgress(null);
       if (fileInput.current) fileInput.current.value = "";
     }
   };
@@ -150,57 +210,59 @@ export default function StudioPage() {
               placeholder="Paste a video link — YouTube, Vimeo, X, TikTok or a direct .mp4"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
-              onKeyDown={(event) => event.key === "Enter" && submit()}
+              onKeyDown={(event) => event.key === "Enter" && !busy && submit()}
               spellCheck={false}
+              aria-label="Video link"
             />
           </div>
           <button type="button" className="btn btn-primary" onClick={submit} disabled={busy}>
-            {busy ? <Loader2 size={15} className="animate-spin" /> : null}
+            {busy && uploadProgress === null ? <Loader2 size={15} className="animate-spin" /> : null}
             Find clips
           </button>
-          <button type="button" className="btn btn-secondary" onClick={() => fileInput.current?.click()} disabled={busy}>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => fileInput.current?.click()}
+            disabled={busy || !uploadsEnabled}
+            title={uploadsEnabled ? "Analyse a video file from your computer" : "Uploads are disabled in Settings"}
+          >
             <Upload size={15} />
             Upload
           </button>
           <input
             ref={fileInput}
             type="file"
-            accept="video/*,audio/*"
+            accept={ACCEPTED_VIDEO}
             hidden
             onChange={(event) => event.target.files?.[0] && upload(event.target.files[0])}
           />
         </div>
 
+        {uploadProgress !== null ? (
+          <div className="mt-3 flex items-center gap-2">
+            <ProgressBar value={uploadProgress} className="max-w-sm" />
+            <span className="text-[11px] text-text-3">
+              {uploadProgress < 1 ? `Uploading · ${Math.round(uploadProgress * 100)}%` : "Upload complete — preparing the project…"}
+            </span>
+          </div>
+        ) : null}
+
         <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <div>
+          <label className="block">
             <span className="label">Aspect ratio</span>
-            <select
-              className="select"
-              value={options.aspect_ratio}
-              onChange={(event) => setOptions({ ...options, aspect_ratio: event.target.value })}
-            >
+            <select className="select" value={options.aspect_ratio} onChange={(event) => change({ aspect_ratio: event.target.value })}>
               {RATIOS.map(([value, label]) => (
                 <option key={value} value={value}>
                   {label}
                 </option>
               ))}
             </select>
-          </div>
-          <div>
+          </label>
+          <label className="block">
             <span className="label">Caption style</span>
-            <select
-              className="select"
-              value={options.caption_preset}
-              onChange={(event) => setOptions({ ...options, caption_preset: event.target.value })}
-            >
-              {CAPTION_STYLES.map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
+            <CaptionStyleSelect value={options.caption_preset} presets={presets} onChange={(value) => change({ caption_preset: value })} />
+          </label>
+          <label className="block">
             <span className="label">Clip length</span>
             <select className="select" value={lengthKey} onChange={(event) => applyLength(event.target.value)}>
               {Object.entries(LENGTHS).map(([key, preset]) => (
@@ -209,27 +271,24 @@ export default function StudioPage() {
                 </option>
               ))}
             </select>
-          </div>
-          <div>
+          </label>
+          <label className="block">
             <span className="label">Layout</span>
-            <select
-              className="select"
-              value={options.layout}
-              onChange={(event) => setOptions({ ...options, layout: event.target.value })}
-            >
-              {LAYOUTS.map(([value, label]) => (
+            <select className="select" value={options.layout} onChange={(event) => change({ layout: event.target.value })}>
+              {LAYOUT_OPTIONS.map(([value, label]) => (
                 <option key={value} value={value}>
                   {label}
                 </option>
               ))}
             </select>
-          </div>
+          </label>
         </div>
 
         <button
           type="button"
           className="mt-3 inline-flex items-center gap-1 text-xs text-text-3 hover:text-text-2"
           onClick={() => setAdvanced(!advanced)}
+          aria-expanded={advanced}
         >
           <ChevronDown size={13} className={`transition-transform ${advanced ? "" : "-rotate-90"}`} />
           Advanced
@@ -239,84 +298,83 @@ export default function StudioPage() {
           <div className="mt-3 grid gap-3 border-t border-line pt-3 sm:grid-cols-2 lg:grid-cols-3">
             <Toggle
               label="Remove silences"
-              hint="Tighten pauses over 0.35 s"
+              hint="Tighten long pauses"
               value={options.remove_silence}
-              onChange={(value) => setOptions({ ...options, remove_silence: value })}
+              onChange={(value) => change({ remove_silence: value })}
             />
             <Toggle
               label="Burn in captions"
               hint="Word-level subtitles on the video"
               value={options.captions_enabled}
-              onChange={(value) => setOptions({ ...options, captions_enabled: value })}
+              onChange={(value) => change({ captions_enabled: value })}
             />
             <Toggle
               label="Punch-ins"
               hint="Small zoom on the strongest lines"
               value={options.auto_zoom}
-              onChange={(value) => setOptions({ ...options, auto_zoom: value })}
+              onChange={(value) => change({ auto_zoom: value })}
             />
             <Toggle
-              label="Translate captions"
-              hint="Off: keep the spoken language"
+              label="Translate to English"
+              hint="Whisper translates speech in any language"
               value={options.translate_captions}
-              onChange={(value) => setOptions({ ...options, translate_captions: value })}
+              onChange={(value) => change({ translate_captions: value })}
             />
             <Toggle
               label="Local LLM review"
-              hint="Ollama, if it is running"
+              hint="Ollama, if it is reachable"
               value={options.llm_enabled}
-              onChange={(value) => setOptions({ ...options, llm_enabled: value })}
+              onChange={(value) => change({ llm_enabled: value })}
             />
-            <div>
+            <label className="block">
               <span className="label">Minimum score · {options.min_score}</span>
               <input
                 type="range"
-                min={50}
+                min={40}
                 max={95}
                 value={options.min_score}
-                onChange={(event) => setOptions({ ...options, min_score: Number(event.target.value) })}
+                onChange={(event) => change({ min_score: Number(event.target.value) })}
                 className="w-full accent-accent"
               />
-            </div>
-            <div>
+            </label>
+            <label className="block">
               <span className="label">How many clips</span>
-              <select
-                className="select"
-                value={options.clip_mode}
-                onChange={(event) => setOptions({ ...options, clip_mode: event.target.value })}
-              >
+              <select className="select" value={options.clip_mode} onChange={(event) => change({ clip_mode: event.target.value })}>
                 <option value="best">Only the strongest</option>
                 <option value="balanced">Balanced</option>
                 <option value="max">Everything publishable</option>
               </select>
-            </div>
+            </label>
             {lengthKey === "custom" ? (
               <div className="sm:col-span-2">
-                <span className="label">Length range (seconds)</span>
+                <span className="label">Length range — minimum / target / maximum (seconds)</span>
                 <div className="flex gap-2">
                   <input
                     className="input"
                     type="number"
                     min={10}
                     max={120}
+                    aria-label="Minimum seconds"
                     value={options.min_clip_seconds}
-                    onChange={(event) => setOptions({ ...options, min_clip_seconds: Number(event.target.value) })}
+                    onChange={(event) => change({ min_clip_seconds: Number(event.target.value) })}
                   />
                   <input
                     className="input"
                     type="number"
                     min={15}
                     max={180}
+                    aria-label="Target seconds"
                     value={options.target_clip_seconds}
-                    onChange={(event) => setOptions({ ...options, target_clip_seconds: Number(event.target.value) })}
+                    onChange={(event) => change({ target_clip_seconds: Number(event.target.value) })}
                   />
                   <input
                     className="input"
                     type="number"
                     min={20}
-                    max={240}
+                    max={300}
+                    aria-label="Maximum seconds"
                     value={options.max_clip_seconds}
-                    onChange={(event) => setOptions({ ...options, max_clip_seconds: Number(event.target.value) })}
+                    onChange={(event) => change({ max_clip_seconds: Number(event.target.value) })}
                   />
                 </div>
               </div>
@@ -334,23 +392,20 @@ export default function StudioPage() {
         {projects.length === 0 ? (
           <div className="card flex flex-col items-center gap-1 px-6 py-12 text-center">
             <Plus size={20} className="text-text-3" />
-            <p className="mt-1 text-sm font-medium text-text-2">No projects yet</p>
+            <p className="mt-1 text-sm font-medium text-text-2">{loaded ? "No projects yet" : "Loading projects…"}</p>
             <p className="max-w-sm text-xs text-text-3">
-              Paste a link above. Analysis runs on this machine; a one-hour episode takes a few minutes to transcribe.
+              Paste a link or upload a video above. A one-hour episode takes a few minutes to transcribe and analyse.
             </p>
           </div>
         ) : (
           <ul className="card divide-y divide-line overflow-hidden">
             {projects.map((project) => {
               const chip = statusChip(project.status);
-              const working = project.status === "analyzing" || project.status === "queued";
+              const working = isAnalysing(project.status);
               return (
                 <li key={project.id} className="flex items-center gap-3 px-4 py-3">
                   <div className="min-w-0 flex-1">
-                    <Link
-                      href={`/projects/${project.id}`}
-                      className="block truncate text-sm font-medium text-text hover:text-accent"
-                    >
+                    <Link href={`/projects/${project.id}`} className="block truncate text-sm font-medium text-text hover:text-accent">
                       {project.title}
                     </Link>
                     <p className="mt-0.5 flex flex-wrap items-center gap-x-2.5 text-[11px] text-text-3">
@@ -358,7 +413,7 @@ export default function StudioPage() {
                       {project.duration ? <span>{clock(project.duration, true)}</span> : null}
                       {project.clip_count ? <span>{project.clip_count} clips</span> : null}
                       {project.rendered_clips ? <span>{project.rendered_clips} rendered</span> : null}
-                      {project.language ? <span>{project.language}</span> : null}
+                      {project.language ? <span className="uppercase">{project.language}</span> : null}
                     </p>
                     {working ? (
                       <div className="mt-2 flex items-center gap-2">
@@ -368,8 +423,10 @@ export default function StudioPage() {
                         </span>
                       </div>
                     ) : null}
-                    {project.error_message ? (
-                      <p className="mt-1 truncate text-[11px] text-bad">{project.error_message}</p>
+                    {project.status === "failed" && project.error?.message ? (
+                      <p className="mt-1 truncate text-[11px] text-bad" title={project.error.hint || project.error.message}>
+                        {project.error.message}
+                      </p>
                     ) : null}
                   </div>
                   <span className={chip.className}>{chip.label}</span>
@@ -388,38 +445,5 @@ export default function StudioPage() {
         )}
       </section>
     </div>
-  );
-}
-
-function Toggle({
-  label,
-  hint,
-  value,
-  onChange,
-}: {
-  label: string;
-  hint?: string;
-  value: boolean;
-  onChange: (value: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={() => onChange(!value)}
-      className="flex items-center justify-between gap-3 rounded-md border border-line bg-surface-2 px-3 py-2 text-left"
-      aria-pressed={value}
-    >
-      <span className="min-w-0">
-        <span className="block text-[13px] font-medium text-text">{label}</span>
-        {hint ? <span className="block truncate text-[11px] text-text-3">{hint}</span> : null}
-      </span>
-      <span
-        className={`relative h-4 w-7 shrink-0 rounded-full transition-colors ${value ? "bg-accent" : "bg-line-strong"}`}
-      >
-        <span
-          className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${value ? "left-3.5" : "left-0.5"}`}
-        />
-      </span>
-    </button>
   );
 }

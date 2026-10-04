@@ -51,19 +51,52 @@ export function statusChip(status: string): { label: string; className: string }
       return { label: "Rendered", className: "chip chip-good" };
     case "rendering":
       return { label: "Rendering", className: "chip chip-warn" };
+    case "running":
+      return { label: "Analysing", className: "chip chip-warn" };
     case "queued":
       return { label: "Queued", className: "chip" };
     case "failed":
       return { label: "Failed", className: "chip chip-bad" };
     case "ready":
       return { label: "Ready", className: "chip chip-good" };
-    case "analyzing":
-      return { label: "Analysing", className: "chip chip-warn" };
+    case "succeeded":
+      return { label: "Done", className: "chip chip-good" };
     case "cancelled":
       return { label: "Cancelled", className: "chip" };
+    case "pending":
+      return { label: "Not rendered", className: "chip" };
+    case "draft":
+      return { label: "Draft", className: "chip" };
     default:
-      return { label: status || "Draft", className: "chip" };
+      return { label: status ? status.charAt(0).toUpperCase() + status.slice(1) : "Draft", className: "chip" };
   }
+}
+
+/** A project that is waiting for or running its analysis. */
+export function isAnalysing(status: string | undefined): boolean {
+  return status === "queued" || status === "running";
+}
+
+/** Human label for a job row. */
+export function jobLabel(job: { kind: string; clip_index?: number; clip_title?: string; project_title?: string }): string {
+  const kind =
+    job.kind === "analyze"
+      ? "Analysis"
+      : job.kind === "render_clip"
+        ? "Render"
+        : job.kind === "render_preview"
+          ? "Preview"
+          : job.kind === "scan_assets"
+            ? "Library scan"
+            : job.kind.replace(/_/g, " ");
+  const clip = job.clip_index ? `clip ${String(job.clip_index).padStart(2, "0")}${job.clip_title ? ` · ${job.clip_title}` : ""}` : "";
+  return [kind, clip || job.project_title].filter(Boolean).join(" — ");
+}
+
+/** Cache-busting media URL: a re-render must never show the previous file. */
+export function mediaUrl(url: string | null | undefined, version?: string | number | null): string {
+  if (!url) return "";
+  return version ? `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(String(version))}` : url;
 }
 
 export function progressLabel(stage: string, progress: number): string {

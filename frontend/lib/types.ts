@@ -12,6 +12,12 @@ export interface ApiError {
   context?: Record<string, unknown>;
 }
 
+/** Project lifecycle as reported by the API. */
+export type ProjectState = "draft" | "queued" | "running" | "ready" | "failed" | "cancelled";
+/** Clip lifecycle as reported by the API. */
+export type ClipState = "pending" | "queued" | "rendering" | "rendered" | "failed";
+export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
 export interface ProjectSummary {
   id: string;
   title: string;
@@ -36,42 +42,55 @@ export interface ProjectSummary {
   speakers: number;
   created_at: string;
   updated_at: string;
-  error_code: string;
-  error_message: string;
+  error: ApiError | null;
   stats: Record<string, any>;
   settings: Record<string, any>;
   rendered_clips?: number;
   pending_clips?: number;
   active_job?: Job | null;
+  /** Only on the detail payload. */
+  has_source?: boolean;
+  language_name?: string;
+}
+
+export interface ProjectDetail extends ProjectSummary {
+  has_source: boolean;
+  language_name: string;
+  source_file: string;
+  clips: ClipSummary[];
+  jobs: Job[];
 }
 
 export interface Job {
   id: string;
-  kind: string;
-  label: string;
-  status: string;
+  kind: "analyze" | "render_clip" | "render_preview" | "scan_assets" | string;
+  status: JobState;
   progress: number;
   stage: string;
   message: string;
   project_id: string;
   clip_id: string;
-  error_code: string;
-  error_message: string;
-  error_hint: string;
+  priority: number;
+  error: ApiError | null;
   created_at: string;
-  started_at: string;
-  finished_at: string;
+  started_at: string | null;
+  finished_at: string | null;
   attempts: number;
-  duration_seconds?: number;
-  log?: LogLine[];
+  cancel_requested?: boolean;
+  duration_seconds?: number | null;
+  /** Per-stage log (GET /api/jobs/{id}, or with_log=true). */
+  stages?: LogLine[];
   result?: Record<string, any>;
+  /** Added by the queue endpoint. */
+  clip_title?: string;
+  clip_index?: number;
+  project_title?: string;
 }
 
 export interface LogLine {
-  at: number;
-  time?: string;
+  stage: string;
   message: string;
-  stage?: string;
+  progress?: number;
 }
 
 export interface StageState {
@@ -97,6 +116,7 @@ export interface QueueState {
   running: Job[];
   queued: Job[];
   failed: Job[];
+  cancelled: Job[];
   recent: Job[];
   counts: { running: number; queued: number; failed: number; total: number };
 }
@@ -111,22 +131,29 @@ export interface ClipSummary {
   category: string;
   category_label: string;
   score: number;
-  confidence: number;
   start: number;
   end: number;
   duration: number;
-  status: string;
+  status: ClipState;
   progress: number;
   stage: string;
   why: string[];
   factors: Record<string, number>;
-  highlights: string[];
-  output_path: string;
-  export_path: string;
-  thumbnail: string;
-  rendered_at: string;
-  error_code: string;
-  error_message: string;
+  has_render: boolean;
+  has_preview: boolean;
+  has_thumbnail: boolean;
+  file_size: number;
+  width: number;
+  height: number;
+  fps: number;
+  render_seconds: number;
+  error: ApiError | null;
+  created_at: string;
+  rendered_at: string | null;
+  render_url: string | null;
+  preview_url: string | null;
+  thumbnail_url: string | null;
+  subtitle_url: string | null;
   words?: TranscriptWord[];
 }
 
@@ -185,9 +212,15 @@ export interface Candidate {
   duplicate_of: string;
 }
 
+export interface TimelineSegment {
+  src_start: number;
+  src_end: number;
+  out_start: number;
+  out_end: number;
+}
+
 export interface ClipDetail extends ClipSummary {
-  captions_enabled?: boolean;
-  has_preview?: boolean;
+  captions_enabled: boolean;
   plan: {
     layout: LayoutMode;
     split_ratio: number;
@@ -197,13 +230,27 @@ export interface ClipDetail extends ClipSummary {
     notes: string[];
     zoom_points: { time: number; strength: number; reason: string }[];
     crop: Record<string, any> | null;
-    timeline: { segments: any[]; removed_seconds?: number; notes?: string[]; source_start: number; source_end: number };
+    timeline: {
+      segments: TimelineSegment[];
+      removed_seconds?: number;
+      output_duration?: number;
+      notes?: string[];
+      source_start: number;
+      source_end: number;
+    };
   };
+  /** Effective per-clip switches (project settings + this clip's edits). */
+  settings: { aspect_ratio: AspectRatio; remove_silence: boolean; auto_zoom: boolean; gameplay_enabled: boolean; music_enabled: boolean };
   captions: CaptionPlan | null;
   caption_presets: string[];
   needs_render: boolean;
-  transcript_text?: string;
   project: { id: string; title: string; language: string; language_mode: string; duration: number };
+}
+
+export interface ClipAssetOptions {
+  gameplay: Asset[];
+  broll: Asset[];
+  music: Asset[];
 }
 
 export interface CaptionPlan {
@@ -222,31 +269,36 @@ export interface CaptionPlan {
 export interface AssetRef {
   id: string;
   name: string;
-  kind: string;
-  category: string;
-  path: string;
-  duration: number;
+  category?: string;
+  path?: string;
   reason?: string;
 }
+
+export type AssetKind = "gameplay" | "broll" | "music";
 
 export interface Asset {
   id: string;
   name: string;
-  kind: string;
+  kind: AssetKind;
   category: string;
+  filename: string;
   path: string;
-  size: number;
-  size_label: string;
+  size_bytes: number;
   duration: number;
   width: number;
   height: number;
   fps: number;
   enabled: boolean;
   favorite: boolean;
-  licence: string;
-  source: string;
+  tags: string[];
+  stream_url: string;
   created_at: string;
-  has_audio: boolean;
+}
+
+export interface AssetLibrary {
+  counts: Record<AssetKind, number>;
+  by_category: Record<AssetKind, Record<string, number>>;
+  total_seconds: number;
 }
 
 export interface SettingsSchemaField {
@@ -258,6 +310,8 @@ export interface SettingsSchemaField {
   value: unknown;
   section: string;
   help: string;
+  /** Server paths cannot be changed on a public deployment. */
+  readonly?: boolean;
   // pydantic constraint metadata, e.g. {"ge": 1, "le": 64}
   ge?: number;
   le?: number;
@@ -305,7 +359,7 @@ export interface HardwareInfo {
   arch: string;
   python: string;
   cpu: { name: string; logical_cores: number; physical_cores: number; usage_percent: number };
-  memory: { total_gb: number; available_gb: number; used_percent: number };
+  memory: { total_gb: number; available_gb: number; used_percent: number; container_limited?: boolean };
   gpu: { available: boolean; vendor: string; cuda: boolean; devices: GpuDevice[] };
   disk: { total_gb?: number; free_gb?: number; used_percent?: number };
   ffmpeg: FfmpegInfo;
@@ -330,7 +384,7 @@ export interface Diagnostics {
   logs: { app: string; worker: string; render: string; ai: string };
   ffmpeg: FfmpegInfo;
   ai: AiStack;
-  errors: { at?: string; logger?: string; message?: string }[];
+  errors: { at?: string; file?: string; logger?: string; message?: string }[];
   python: string;
   platform: string;
 }
@@ -346,6 +400,25 @@ export interface SystemStatus {
   workers: { running: boolean; workers: number; worker_names: string[]; busy: string[]; uptime_seconds: number };
   queue: { queued: number; running: number };
   usage: { cpu_percent: number; memory_percent: number; process_memory_mb: number; process_cpu_percent: number };
+  /** What this deployment allows (local paths / folders only on the desktop app). */
+  features: { local_paths: boolean; open_folder: boolean };
   notes: SystemNote[];
+}
+
+export interface CleanupReport {
+  days: number;
+  dry_run: boolean;
+  cache: { removed_files: number; freed_bytes: number; remaining_bytes: number };
+  projects_removed: { id: string; title: string; status: string; bytes: number }[];
+  renders_removed: number;
+  source_files_removed: number;
+  freed_bytes: number;
+  usage: Record<string, number>;
+}
+
+export interface CaptionPresetInfo {
+  label: string;
+  description: string;
+  theme: Record<string, unknown>;
 }
 
