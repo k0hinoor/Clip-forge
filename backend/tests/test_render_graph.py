@@ -9,6 +9,7 @@ by the ``e2e`` module.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -145,14 +146,46 @@ def test_zoom_amplitude_is_bounded():
     assert f"{MAX_ZOOM * 0.3:.4f}*" in quiet, "a weak moment still gets a visible push"
 
 
-def test_punch_ins_are_skipped_when_the_source_frame_rate_is_unknown():
-    """zoompan renumbers timestamps, so it may only run against a known cadence."""
-    spec = _spec(layout="podcast", zoom_points=[ZoomPoint(time=4.0, strength=1.0, reason="hook")], source_fps=0.0)
+def test_punch_ins_run_on_the_normalised_output_cadence():
+    """zoompan stamps one frame per input frame on its own clock.
+
+    Its input is the stream already normalised to the output rate, so it must use
+    that rate - a 25 fps source zoomed on a 25 fps clock after normalisation to
+    30 fps came out 20% longer than its audio.
+    """
+    spec = _spec(layout="podcast", zoom_points=[ZoomPoint(time=4.0, strength=1.0, reason="hook")], source_fps=25.0)
     graph, video_label, _audio, _inputs = build_filter_graph(spec)
 
-    assert "zoompan" not in graph
-    assert any("frame rate" in note for note in spec.notes), spec.notes
+    assert f"fps={spec.fps}[vstd]" in graph
+    assert f":fps={spec.fps}," in graph, "zoompan must run at the normalised output rate"
+    assert ":fps=25" not in graph
     assert video_label == "vout"
+
+
+def test_split_panel_keeps_the_speaker_aspect_ratio():
+    """A crop cut for the full 9:16 frame is re-cut for the shorter split panel."""
+    full_frame = plan_for_layout("split", 1920, 1080, 540, 960, [], duration=10.0, smart=False, tracking=False)
+    spec = _spec(layout="split", crop_plan=full_frame, gameplay_path=Path("/tmp/gameplay.mp4"), split_ratio=60)
+    graph, _video, _audio, _inputs = build_filter_graph(spec)
+
+    panel_height = int(round(960 * 60 / 100.0 / 2) * 2)
+    expected_crop_width = int(round(1080 * 540 / panel_height))
+    expected_crop_width -= expected_crop_width % 2
+    assert f"crop=w={expected_crop_width}:h=1080" in graph, graph[:400]
+    assert f"scale=540:{panel_height}:force_original_aspect_ratio=increase" in graph
+    assert f"crop=540:{panel_height}" in graph
+
+
+def test_music_ducking_splits_the_voice_pad():
+    """The voice feeds both amix and the side-chain, so it must be split first."""
+    settings = AppSettings(music_enabled=True, ducking=True, ducking_db=-12.0)
+    spec = _spec(layout="podcast", music_path=Path("/tmp/music.mp3"), settings=settings)
+    graph, _video, _audio, _inputs = build_filter_graph(spec)
+
+    assert "asplit=2[voice][voicekey]" in graph
+    assert "[mus][voicekey]sidechaincompress" in graph
+    assert graph.count("[voice]") == 2, "defined once by asplit, consumed once by amix"
+    assert "ratio=9.0" in graph
 
 
 def test_filter_graph_terminates_every_layer():

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Query
+from pydantic import BaseModel, Field
 
 from ...config import Env, get_settings
 from ...errors import ClipForgeError, ErrorCode
@@ -13,7 +13,17 @@ from ...logging_setup import recent_errors, tail_log
 from ...media.assets import ensure_seed_assets, library_summary
 from ...media.download import classify_url, fetch_metadata
 from ...services import events
-from ...system import ai_stack, diagnostics, ffmpeg_info, hardware, process_snapshot
+from ...system import (
+    ai_stack,
+    diagnostics,
+    disk_report,
+    features,
+    ffmpeg_info,
+    fit_whisper_model,
+    hardware,
+    process_snapshot,
+    require_local_paths,
+)
 from ..schemas import OllamaTestRequest
 
 router = APIRouter(prefix="/system", tags=["system"])
@@ -49,6 +59,7 @@ def get_status():
             "running": sum(1 for job in with_busy if job["status"] == "running"),
         },
         "usage": process_snapshot(),
+        "features": features(),
         "notes": _status_notes(ffmpeg, stack, settings),
     }
 
@@ -95,6 +106,9 @@ def _status_notes(ffmpeg, stack, settings) -> list[dict[str, str]]:
                 "detail": "Analysis runs in analytical mode using the built-in scoring engine.",
             }
         )
+    model, downgrade = fit_whisper_model(settings.whisper_model)
+    if downgrade and stack.get("transcription_available"):
+        notes.append({"level": "info", "title": f"Whisper '{model}' will be used", "detail": downgrade})
     return notes
 
 
@@ -120,6 +134,7 @@ def detect_ffmpeg(path: str = Body("", embed=True), ffprobe: str = Body("", embe
     from ...system import invalidate_cache
 
     if path:
+        require_local_paths("Choosing an ffmpeg binary")
         candidate = Path(path).expanduser()
         if not candidate.exists():
             raise ClipForgeError(
@@ -142,30 +157,44 @@ def get_ffmpeg():
     return {"ffmpeg": ffmpeg_info().to_dict()}
 
 
+def _ollama_settings(base_url: str = "", model: str = ""):
+    """Current settings with an Ollama URL/model under test (never persisted)."""
+    settings = get_settings()
+    update: dict[str, str] = {}
+    if base_url.strip():
+        url = base_url.strip().rstrip("/")
+        if not url.startswith(("http://", "https://")):
+            raise ClipForgeError(
+                code=ErrorCode.INVALID_INPUT,
+                message="The Ollama URL must start with http:// or https://.",
+                hint="For a local install use http://127.0.0.1:11434.",
+                status_code=422,
+            )
+        update["ollama_base_url"] = url
+    if model.strip():
+        update["ollama_model"] = model.strip()
+    return settings.model_copy(update=update) if update else settings
+
+
 @router.post("/ollama/test")
 def test_ollama(payload: OllamaTestRequest = Body(default_factory=OllamaTestRequest)):  # noqa: B008
-    """Check whether Ollama is reachable and the configured model exists."""
-    from ...ai.llm import OllamaClient
-    from ...config import settings_store
+    """Check whether Ollama is reachable and the model exists.
 
-    settings = get_settings()
-    patch: dict[str, str] = {}
-    if payload.base_url:
-        patch["ollama_base_url"] = payload.base_url
-    if payload.model:
-        patch["ollama_model"] = payload.model
-    if patch:
-        settings = settings_store().update(patch)
-    client = OllamaClient(settings)
-    status = client.health()
+    ``base_url``/``model`` in the body are tested without being saved - save
+    them through ``PUT /api/settings`` once the test passes.
+    """
+    from ...ai.llm import OllamaClient
+
+    settings = _ollama_settings(payload.base_url or "", payload.model or "")
+    status = OllamaClient(settings).health()
     return {"status": status.to_dict(), "models": status.models}
 
 
 @router.get("/ollama/models")
-def list_ollama_models():
+def list_ollama_models(base_url: str = Query("", description="Ask this Ollama server instead of the configured one")):
     from ...ai.llm import available_models
 
-    settings = get_settings()
+    settings = _ollama_settings(base_url)
     return {"models": available_models(settings), "base_url": settings.ollama_base_url, "current": settings.ollama_model}
 
 
@@ -237,6 +266,30 @@ def get_paths():
         "exports": str(settings.resolved_export_dir()),
         "env": {"host": Env.HOST, "port": Env.PORT, "embedded_worker": Env.EMBED_WORKER},
     }
+
+
+class CleanupRequest(BaseModel):
+    days: int | None = Field(None, ge=0, le=3650, description="Age threshold; default = Settings -> Storage -> Clean up after")
+    renders: bool = Field(False, description="Also delete rendered clip files older than the threshold (clips can be re-rendered)")
+    dry_run: bool = Field(False, description="Only report what would be removed")
+
+
+@router.post("/cleanup")
+def cleanup(payload: CleanupRequest | None = Body(default=None)):  # noqa: B008
+    """Free disk space: expired download cache, stale unfinished projects, optionally old renders."""
+    from ...services.storage import cleanup_storage, storage_usage
+
+    body = payload or CleanupRequest()
+    report = cleanup_storage(days=body.days, include_renders=body.renders, dry_run=body.dry_run)
+    return {**report, "usage": storage_usage()}
+
+
+@router.get("/storage")
+def storage():
+    """Bytes used by projects, cache, assets, exports and logs."""
+    from ...services.storage import storage_usage
+
+    return {"usage": storage_usage(), "disk": disk_report()}
 
 
 @router.get("/health")

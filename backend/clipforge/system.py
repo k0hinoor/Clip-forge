@@ -377,13 +377,58 @@ def hardware(refresh: bool = False) -> dict[str, Any]:
     return _cached("hardware", _detect_hardware)
 
 
-def _detect_hardware() -> dict[str, Any]:
+def container_memory() -> tuple[int, int]:
+    """``(limit_bytes, used_bytes)`` from the cgroup, or ``(0, 0)`` when unlimited.
+
+    psutil reports the *host's* RAM; inside a container (Docker, Render, Fly...)
+    the process can only use the cgroup limit, which is what model choices and
+    concurrency must be based on.
+    """
+    candidates = (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"), Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+    )
+    for limit_file, usage_file in candidates:
+        try:
+            raw = limit_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw or raw == "max":
+            return 0, 0
+        try:
+            limit = int(raw)
+        except ValueError:
+            return 0, 0
+        if limit <= 0 or limit >= 1 << 60:  # cgroup v1 reports "unlimited" as a huge number
+            return 0, 0
+        try:
+            used = int(usage_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            used = 0
+        return limit, used
+    return 0, 0
+
+
+def effective_memory() -> tuple[int, int]:
+    """``(total_bytes, available_bytes)`` the process can really use."""
     try:
         import psutil  # type: ignore
 
         memory = psutil.virtual_memory()
-        ram_total = memory.total
-        ram_available = memory.available
+        total, available = memory.total, memory.available
+    except Exception:  # pragma: no cover - psutil is a hard dependency
+        total = available = 0
+    limit, used = container_memory()
+    if limit and (not total or limit < total):
+        return limit, max(0, min(available or limit, limit - used))
+    return total, available
+
+
+def _detect_hardware() -> dict[str, Any]:
+    try:
+        import psutil  # type: ignore
+
+        ram_total, ram_available = effective_memory()
         cpu_count = psutil.cpu_count(logical=True) or os.cpu_count() or 1
         cpu_physical = psutil.cpu_count(logical=False) or cpu_count
         cpu_percent = psutil.cpu_percent(interval=None)
@@ -430,6 +475,7 @@ def _detect_hardware() -> dict[str, Any]:
             "total_gb": round(ram_total / 1e9, 1),
             "available_gb": round(ram_available / 1e9, 1),
             "used_percent": round((1 - (ram_available / ram_total)) * 100, 1) if ram_total else 0.0,
+            "container_limited": bool(container_memory()[0]),
         },
         "gpu": gpu or {"available": False, "vendor": "none", "cuda": False, "devices": []},
         "disk": disk,
@@ -442,6 +488,45 @@ def _detect_hardware() -> dict[str, Any]:
             "concurrency": max(1, min(2, cpu_count // 4)),
         },
     }
+
+
+# Approximate peak RSS (GB) of a CPU int8 faster-whisper run, process overhead included.
+WHISPER_MEMORY_GB: dict[str, float] = {
+    "tiny": 0.6, "tiny.en": 0.6,
+    "base": 0.8, "base.en": 0.8,
+    "small": 1.4, "small.en": 1.4,
+    "distil-small.en": 1.2,
+    "medium": 2.8, "medium.en": 2.8,
+    "distil-medium.en": 2.0,
+    "large-v3-turbo": 2.8, "turbo": 2.8, "distil-large-v3": 2.6, "distil-large-v2": 2.6,
+    "large-v1": 4.5, "large-v2": 4.5, "large-v3": 4.5, "large": 4.5,
+}
+_WHISPER_LADDER = ("large-v3", "medium", "small", "base", "tiny")
+
+
+def fit_whisper_model(requested: str) -> tuple[str, str]:
+    """The requested model, or the largest one that fits in this machine's memory.
+
+    Returns ``(model, note)``; ``note`` is empty when nothing changed. Loading a
+    model bigger than the container limit gets the whole server OOM-killed, so
+    downgrading (and saying so) is the only outcome that still produces clips.
+    """
+    need = WHISPER_MEMORY_GB.get(requested)
+    total, _available = effective_memory()
+    if not need or not total:
+        return requested, ""
+    total_gb = total / 1e9
+    if need <= total_gb:
+        return requested, ""
+    for candidate in _WHISPER_LADDER:
+        if WHISPER_MEMORY_GB[candidate] <= total_gb:
+            if WHISPER_MEMORY_GB[candidate] >= need:
+                return requested, ""
+            return candidate, (
+                f"Using the '{candidate}' Whisper model instead of '{requested}': "
+                f"this machine has {total_gb:.1f} GB of memory and '{requested}' needs about {need:g} GB."
+            )
+    return "tiny", f"Only {total_gb:.1f} GB of memory is available - using the 'tiny' Whisper model, which may still run out of memory."
 
 
 def recommend_whisper_model(ram_bytes: int, gpu: dict[str, Any] | None) -> str:
@@ -486,14 +571,57 @@ def ensure_disk_space(required_gb: float = 2.0) -> None:
         )
 
 
+def features() -> dict[str, bool]:
+    """Capabilities the UI should offer on this deployment."""
+    local = Env.local_paths_allowed()
+    return {"local_paths": local, "open_folder": local}
+
+
+def require_local_paths(action: str) -> None:
+    """Refuse server-filesystem features on a public deployment."""
+    if Env.local_paths_allowed():
+        return
+    from .errors import ClipForgeError, ErrorCode
+
+    raise ClipForgeError(
+        code=ErrorCode.INVALID_INPUT,
+        message=f"{action} is only available when CLIPFORGE runs on your own computer.",
+        hint="Upload the file instead. Server admins can enable it with CLIPFORGE_ALLOW_LOCAL_PATHS=true.",
+        status_code=403,
+    )
+
+
+def open_in_file_manager(target: Path) -> None:
+    """Reveal ``target`` in the OS file manager (desktop installs only)."""
+    from .errors import ClipForgeError, ErrorCode
+
+    require_local_paths("Opening folders")
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(target))  # type: ignore[attr-defined]  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])  # noqa: S603,S607
+        else:
+            subprocess.Popen(["xdg-open", str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # noqa: S603,S607
+    except Exception as exc:  # noqa: BLE001 - headless machines have no file manager
+        raise ClipForgeError(
+            code=ErrorCode.INTERNAL,
+            message="Could not open the folder automatically.",
+            hint=f"Open it manually: {target}",
+            detail=str(exc),
+            status_code=501,
+        ) from exc
+
+
 def process_snapshot() -> dict[str, Any]:
     """Lightweight live usage numbers for the dashboard header."""
     try:
         import psutil  # type: ignore
 
+        total, available = effective_memory()
         return {
             "cpu_percent": psutil.cpu_percent(interval=None),
-            "memory_percent": psutil.virtual_memory().percent,
+            "memory_percent": round((1 - available / total) * 100, 1) if total else psutil.virtual_memory().percent,
             "process_memory_mb": round(psutil.Process().memory_info().rss / 1e6, 1),
             "process_cpu_percent": psutil.Process().cpu_percent(interval=None),
         }
@@ -519,9 +647,11 @@ def diagnostics() -> dict[str, Any]:
         "ai": stack,
         "errors": [
             {
-                "at": str(error.get("ts") or error.get("time") or ""),
-                "logger": str(error.get("file") or error.get("logger") or ""),
-                "message": str(error.get("message") or error.get("event") or ""),
+                "at": str(error.get("ts") or ""),
+                "file": str(error.get("file") or ""),
+                "logger": str(error.get("logger") or ""),
+                # JsonFormatter writes the text under "msg".
+                "message": str(error.get("msg") or error.get("message") or ""),
             }
             for error in recent_errors(30)
         ],
@@ -532,13 +662,20 @@ def diagnostics() -> dict[str, Any]:
 
 __all__ = [
     "FfmpegInfo",
+    "WHISPER_MEMORY_GB",
     "ai_stack",
+    "container_memory",
     "diagnostics",
     "disk_report",
+    "effective_memory",
     "ensure_disk_space",
+    "features",
     "ffmpeg_info",
+    "fit_whisper_model",
     "hardware",
     "invalidate_cache",
+    "open_in_file_manager",
     "process_snapshot",
     "recommend_whisper_model",
+    "require_local_paths",
 ]

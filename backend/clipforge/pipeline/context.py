@@ -20,9 +20,10 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 from .. import __version__
 from ..ai.segment import Sentence
@@ -80,6 +81,28 @@ class NullReporter(ProgressReporter):
 # --------------------------------------------------------------------------- #
 # Project paths
 # --------------------------------------------------------------------------- #
+
+
+DEFAULT_FILENAME_TEMPLATE = "{project_slug}_{index:02d}_{title_slug}"
+
+
+def render_basename(template: str, *, index: int, title: str, project: str) -> str:
+    """Expand an export filename template safely.
+
+    Placeholders: ``{project_slug}``, ``{index}`` (format specs such as
+    ``{index:02d}`` work) and ``{title_slug}``. A broken template falls back
+    to the default instead of failing the render.
+    """
+    values = {
+        "project_slug": slugify(project, max_length=40),
+        "index": index,
+        "title_slug": slugify(title, max_length=48),
+    }
+    try:
+        name = (template or DEFAULT_FILENAME_TEMPLATE).format(**values)
+    except (KeyError, IndexError, ValueError, AttributeError):
+        name = DEFAULT_FILENAME_TEMPLATE.format(**values)
+    return SAFE_NAME.sub("-", name).strip("-.") or f"clip_{index:02d}"
 
 
 @dataclass
@@ -151,19 +174,36 @@ class ProjectPaths:
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    def render_path(self, index: int, title: str, *, extension: str = ".mp4") -> Path:
-        settings = get_settings()
-        template = settings.export_filename_template or "{project_slug}_{index:02d}_{title_slug}"
-        name = template.format(
-            project_slug=slugify(self.root.name, max_length=40),
+    def render_path(
+        self,
+        index: int,
+        title: str,
+        *,
+        project_title: str = "",
+        reuse: str = "",
+        extension: str = ".mp4",
+    ) -> Path:
+        """Where a clip's final render goes, named by ``export_filename_template``.
+
+        ``reuse`` is the clip's current file: when the name has not changed the
+        clip is re-rendered in place instead of piling up timestamped copies.
+        """
+        name = render_basename(
+            get_settings().export_filename_template,
             index=index,
-            title_slug=slugify(title, max_length=48),
+            title=title,
+            project=project_title or self.root.name,
         )
-        name = SAFE_NAME.sub("-", name).strip("-") or f"clip_{index:02d}"
         self.renders.mkdir(parents=True, exist_ok=True)
         target = self.renders / f"{name}{extension}"
+        if reuse:
+            previous = Path(reuse)
+            same_folder = previous.parent.resolve() == self.renders.resolve()
+            same_name = previous.name == target.name or re.fullmatch(rf"{re.escape(name)}_\d+{re.escape(extension)}", previous.name)
+            if same_folder and same_name:
+                return previous
         if target.exists():
-            target = self.renders / f"{name}_{int(target.stat().st_mtime)}{extension}"
+            target = self.renders / f"{name}_{int(time.time())}{extension}"
         return target
 
     def safe_child(self, folder: Path, filename: str) -> Path:

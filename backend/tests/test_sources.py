@@ -95,10 +95,28 @@ def test_the_api_accepts_a_non_youtube_link():
 
 def test_the_create_screen_caption_style_reaches_the_settings():
     from clipforge.api.schemas import ClipOptions
+    from clipforge.config import AppSettings, merge_settings_patch
 
     patch = ClipOptions(caption_preset="karaoke").to_settings_patch()
     assert patch["caption"]["preset"] == "karaoke"
-    assert patch["caption"]["animation"] == "karaoke"
+
+    # The preset's look is applied when the patch is merged over the settings,
+    # and caption choices the preset does not define are kept.
+    base = AppSettings(caption={"font": "Montserrat"}).model_dump()
+    effective = AppSettings.model_validate(merge_settings_patch(base, patch))
+    assert effective.caption.preset == "karaoke"
+    assert effective.caption.animation == "karaoke"
+    assert effective.caption.font == "Montserrat"
+
+
+def test_create_options_only_override_what_the_client_chose():
+    from clipforge.api.schemas import ClipOptions
+
+    assert ClipOptions().to_settings_patch() == {}
+    assert ClipOptions.model_validate({"min_score": 55, "captions_enabled": False}).to_settings_patch() == {
+        "min_score": 55.0,
+        "captions_enabled": False,
+    }
 
 
 def test_a_clip_can_be_given_a_caption_style_by_name():

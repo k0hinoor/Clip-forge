@@ -13,7 +13,6 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterator
 
 from sqlalchemy import (
@@ -360,6 +359,7 @@ class Clip(Base):
             "hook": self.hook,
             "summary": self.summary,
             "category": self.category,
+            "category_label": _category_label(self.category),
             "score": round(self.score, 1),
             "why": self.why,
             "factors": json.loads(self.factors_json or "{}"),
@@ -541,6 +541,12 @@ class KeyValue(Base):
 
 _ENGINE: Engine | None = None
 _SESSION_FACTORY: sessionmaker[Session] | None = None
+
+
+def _category_label(key: str) -> str:
+    from .constants import category_label  # constants is a leaf module
+
+    return category_label(key or "")
 
 
 def iso(value: datetime | None) -> str | None:

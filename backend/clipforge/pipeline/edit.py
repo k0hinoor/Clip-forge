@@ -21,15 +21,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from ..ai.features import CandidateFeatures
 from ..ai.language import LanguageProfile
 from ..ai.segment import Sentence
 from ..ai.transcribe import Word
 from ..ai.vision import analyse_frames, sample_times, summarise, vision_available
-from ..config import AppSettings, CaptionTheme, get_settings
-from ..constants import category_label
+from ..config import AppSettings, CaptionTheme
 from ..logging_setup import get_logger
 from ..media import assets as assets_mod
 from ..media.captions import CaptionPlan, plan_captions
@@ -100,28 +99,7 @@ def build_clip_plan(
     features = features or candidate.features
 
     # ------------------------------------------------------------- pacing
-    timeline = build_timeline(candidate.start, candidate.end, [], settings=settings)
-    if source_path is not None and settings.remove_silence:
-        try:
-            silences = detect_silence(
-                source_path,
-                noise_db=settings.silence_threshold_db,
-                min_duration=settings.silence_min_duration,
-                start=candidate.start,
-                end=candidate.end,
-            )
-            timeline = build_timeline(
-                candidate.start,
-                candidate.end,
-                silences,
-                settings=settings,
-                min_output_seconds=settings.min_clip_seconds,
-                max_output_seconds=settings.max_clip_seconds,
-            )
-        except Exception as exc:  # noqa: BLE001 - pacing is best-effort
-            log.warning("silence detection failed for %s: %s", project_id, exc)
-            notes.append("Silence detection failed - the clip keeps its original pacing.")
-    notes.extend(timeline.notes)
+    timeline = plan_timeline(source_path, candidate.start, candidate.end, settings, notes)
 
     caption_words = _remap_words(words, timeline)
     zoom_points = plan_zoom_points(sentences, features, timeline)
@@ -224,6 +202,38 @@ def build_clip_plan(
     )
     _write_plan_files(paths, index, plan, caption_words)
     return plan.to_dict()
+
+
+def plan_timeline(source_path: Path | None, start: float, end: float, settings: AppSettings, notes: list[str] | None = None) -> Timeline:
+    """The clip's output timeline: ``start..end`` minus the removable silences.
+
+    Used when a clip is planned and again whenever it is trimmed, so an edited
+    clip keeps the same pacing rules as a freshly analysed one.
+    """
+    notes = notes if notes is not None else []
+    timeline = build_timeline(start, end, [], settings=settings)
+    if source_path is not None and settings.remove_silence:
+        try:
+            silences = detect_silence(
+                source_path,
+                noise_db=settings.silence_threshold_db,
+                min_duration=settings.silence_min_duration,
+                start=start,
+                end=end,
+            )
+            timeline = build_timeline(
+                start,
+                end,
+                silences,
+                settings=settings,
+                min_output_seconds=settings.min_clip_seconds,
+                max_output_seconds=settings.max_clip_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - pacing is best-effort
+            log.warning("silence detection failed for %s: %s", source_path.name, exc)
+            notes.append("Silence detection failed - the clip keeps its original pacing.")
+    notes.extend(timeline.notes)
+    return timeline
 
 
 def _write_plan_files(paths: ProjectPaths, index: int, plan: ClipPlan, caption_words: Sequence[Word]) -> None:
@@ -378,9 +388,50 @@ def clip_settings(settings: AppSettings, layout: dict[str, Any]) -> AppSettings:
         return settings
     try:
         return AppSettings.model_validate({**settings.model_dump(), **patch})
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - stale overrides must not break a render
         log.warning("ignoring clip overrides (%s)", exc)
         return settings
+
+
+def ensure_layout_asset(layout: dict[str, Any], settings: AppSettings, *, clip_key: str, category: str = "", duration: float = 60.0) -> str:
+    """Give a split/gameplay/B-roll layout an asset when it has none.
+
+    Returns a note for the plan ("" when nothing had to change). Without this,
+    switching a clip to split screen rendered a plain speaker cut because no
+    gameplay clip had been chosen when the clip was planned with another layout.
+    """
+    notes: list[str] = []
+    if layout.get("music_enabled") and not resolve_asset(layout.get("music")):
+        choice = assets_mod.pick_music(clip_key=clip_key, settings=settings.model_copy(update={"music_enabled": True}), category=category)
+        if choice is None:
+            notes.append("No music in the library yet - import some in Assets -> Music.")
+        else:
+            layout["music"] = choice.to_dict()
+            notes.append(f"Music: {choice.name}.")
+    note = _ensure_visual_asset(layout, settings, clip_key=clip_key, category=category, duration=duration)
+    return " ".join([*notes, note]).strip()
+
+
+def _ensure_visual_asset(layout: dict[str, Any], settings: AppSettings, *, clip_key: str, category: str, duration: float) -> str:
+    mode = layout.get("layout")
+    if mode in {"split", "gameplay"} and not resolve_asset(layout.get("gameplay")):
+        choice = assets_mod.pick_gameplay(
+            clip_key=clip_key,
+            category=category,
+            duration=duration,
+            settings=settings.model_copy(update={"gameplay_enabled": True, "gameplay_mode": settings.gameplay_mode if settings.gameplay_mode != "off" else "auto"}),
+        )
+        if choice is None:
+            return "No gameplay footage in the library yet - import some in Assets for the split screen."
+        layout["gameplay"] = choice.to_dict()
+        return f"Gameplay: {choice.name} ({choice.reason})."
+    if mode == "broll" and not resolve_asset(layout.get("broll")):
+        choice = assets_mod.pick_broll(clip_key=clip_key, settings=settings.model_copy(update={"broll_enabled": True}))
+        if choice is None:
+            return "No B-roll in the library yet - import some in Assets for this layout."
+        layout["broll"] = choice.to_dict()
+        return f"B-roll: {choice.name} ({choice.reason})."
+    return ""
 
 
 def rebuild_captions(clip: Any, settings: AppSettings, language: str, zoom_times: Sequence[float]) -> CaptionPlan | None:

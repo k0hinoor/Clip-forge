@@ -51,10 +51,12 @@ def _print_banner(url: str) -> None:
 def command_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
-    from .api.app import app
-
     host = args.host or Env.HOST
     port = args.port or Env.PORT
+    # The app reads these while it is built (CORS origins, local-only features).
+    Env.HOST, Env.PORT = host, port
+
+    from .api.app import app
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     url = f"http://{display_host}:{port}"
 

@@ -15,7 +15,7 @@ so explicitly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -269,6 +269,43 @@ def crop_plan_from_dict(payload: dict[str, Any] | None) -> CropPlan | None:
     return plan
 
 
+def fit_crop_to_panel(plan: CropPlan | None, panel_width: int, panel_height: int) -> CropPlan | None:
+    """Return ``plan`` with its crop window re-cut for a ``panel_width x panel_height`` panel.
+
+    Crop plans are stored per clip and may have been computed for another
+    panel: the full 9:16 frame when the clip is now a split screen, or a ratio
+    the user has since changed. The subject keyframes stay valid (they are
+    relative positions), so only the window size is recomputed: full height
+    when the source is wider than the panel, full width when it is taller.
+    """
+    if plan is None or plan.source_width <= 0 or plan.source_height <= 0 or panel_width <= 0 or panel_height <= 0:
+        return plan
+    target_ratio = panel_width / panel_height
+    if plan.source_width / plan.source_height > target_ratio:
+        crop_height = plan.source_height
+        crop_width = min(plan.source_width, int(round(crop_height * target_ratio)))
+    else:
+        crop_width = plan.source_width
+        crop_height = min(plan.source_height, int(round(crop_width / target_ratio)))
+    crop_width = max(2, crop_width - crop_width % 2)
+    crop_height = max(2, crop_height - crop_height % 2)
+    if (crop_width, crop_height, panel_width, panel_height) == (plan.crop_width, plan.crop_height, plan.target_width, plan.target_height):
+        return plan
+    return CropPlan(
+        source_width=plan.source_width,
+        source_height=plan.source_height,
+        target_width=panel_width,
+        target_height=panel_height,
+        crop_width=crop_width,
+        crop_height=crop_height,
+        mode=plan.mode,
+        keyframes=list(plan.keyframes),
+        notes=list(plan.notes),
+        face_ratio=plan.face_ratio,
+        shot_type=plan.shot_type,
+    )
+
+
 def plan_for_layout(
     layout: str,
     source_width: int,
@@ -305,4 +342,4 @@ def plan_for_layout(
     return plan
 
 
-__all__ = ["CropKeyframe", "CropPlan", "plan_crop", "plan_for_layout"]
+__all__ = ["CropKeyframe", "CropPlan", "crop_plan_from_dict", "fit_crop_to_panel", "plan_crop", "plan_for_layout"]

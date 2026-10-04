@@ -11,17 +11,16 @@ import json
 from typing import Any, get_args
 
 from fastapi import APIRouter, Body, Query
-from pydantic import ValidationError
 from sqlalchemy import select
 
-from ...config import SECTION_FIELDS, AppSettings, Env, get_settings, settings_store
+from ...config import SECTION_FIELDS, SERVER_PATH_FIELDS, AppSettings, Env, get_settings, settings_store
 from ...constants import CAPTION_PRESETS
 from ...db import Template, session_scope
 from ...errors import ClipForgeError, ErrorCode, not_found
 from ...logging_setup import get_logger
 from ...services import events
 from ...system import invalidate_cache
-from ..schemas import SettingsUpdate, TemplateCreate
+from ..schemas import TemplateCreate
 
 router = APIRouter(tags=["settings"])
 log = get_logger(__name__)
@@ -125,10 +124,81 @@ FIELD_LABELS: dict[str, str] = {
 }
 
 
+FIELD_HELP: dict[str, str] = {
+    "concurrency": "Analyses run one at a time; extra threads let renders run alongside an analysis.",
+    "max_concurrent_renders": "How many clips may encode at the same time.",
+    "auto_start_worker": "Process the queue as soon as the app starts.",
+    "llm_enabled": "Ask a local Ollama model for its own read of the transcript. Analysis works without it.",
+    "ollama_base_url": "Address of the Ollama server, e.g. http://127.0.0.1:11434.",
+    "ollama_model": "Any chat model you have pulled in Ollama (ollama pull qwen3:4b).",
+    "whisper_model": "tiny/base are fastest; small is the default; medium and large-v3 are most accurate but need more memory.",
+    "whisper_device": "auto picks CUDA when an NVIDIA GPU is available.",
+    "whisper_compute_type": "auto = int8 on CPU, float16 on GPU.",
+    "whisper_beam_size": "Higher is slightly more accurate and slower (1-5).",
+    "whisper_initial_prompt": "Names or jargon that appear in the video help recognition.",
+    "word_alignment": "WhisperX alignment gives tighter word timings when it is installed.",
+    "diarization": "energy = built-in speaker detection; off treats everything as one speaker.",
+    "language_hint": "ISO code such as en, hi or es. Leave blank to detect automatically.",
+    "keep_source_audio": "Keep the extracted 16 kHz WAV after analysis (it is re-extracted when needed).",
+    "hw_accel": "GPU encoders are much faster; auto falls back to x264 when none is available.",
+    "output_fps": "Frame rate of the rendered clips.",
+    "allow_60fps": "When off, 50/60 fps settings render at 30 fps.",
+    "render_preset": "Slower presets give smaller files at the same quality.",
+    "crf": "18-23 is visually lossless to high quality; higher numbers mean smaller files.",
+    "video_bitrate_kbps": "0 = constant quality (CRF). Set a bitrate only if a platform requires one.",
+    "cookies_path": "Netscape cookies.txt for videos that need a login (age-restricted or members-only).",
+    "proxy": "Used only for downloads, e.g. socks5://127.0.0.1:1080.",
+    "max_source_hours": "Longer videos are rejected before downloading.",
+    "clip_mode": "best = only the strongest moments, balanced = a sensible set, max = everything above the score.",
+    "min_score": "Moments scoring below this (0-100) do not become clips.",
+    "max_clips": "0 = no limit.",
+    "aspect_ratio": "9:16 for Shorts/Reels/TikTok, 1:1 for feeds, 16:9 for YouTube.",
+    "output_width": "Must match the aspect ratio; otherwise the ratio's default size is used.",
+    "output_height": "Must match the aspect ratio; otherwise the ratio's default size is used.",
+    "smart_reframe": "Follow faces and motion when cropping to vertical (uses OpenCV when installed).",
+    "auto_zoom": "Subtle punch-ins on emphatic moments.",
+    "speaker_tracking": "Pan between speakers instead of a fixed crop.",
+    "remove_silence": "Cut long pauses to tighten the pacing.",
+    "silence_threshold_db": "Audio quieter than this counts as silence.",
+    "silence_min_duration": "Only pauses longer than this are shortened.",
+    "captions_enabled": "Burn word-by-word captions into every clip.",
+    "translate_captions": "Have Whisper translate the speech into English captions. Uploaded transcript files are used as-is.",
+    "gameplay_enabled": "Fill the lower part of split-screen clips with gameplay footage from your library.",
+    "layout": "split = speaker over gameplay, podcast = speaker only, blur = full frame over a blurred copy.",
+    "split_ratio": "Share of the frame used by the speaker in split layouts.",
+    "gameplay_volume": "0 mutes the gameplay audio.",
+    "normalize_loudness": "Match the loudness platforms expect.",
+    "target_lufs": "-14 LUFS suits most short-form platforms.",
+    "voice_boost": "Gentle EQ and compression for clearer speech.",
+    "music_enabled": "Add background music from your library (Assets -> Music).",
+    "music_volume": "Music level before ducking (0-1).",
+    "ducking": "Lower the music while someone is talking.",
+    "ducking_db": "How far the music dips under speech (-6 subtle, -12 typical, -20 strong).",
+    "export_dir": "Copies of exported clips go here. Blank = the data folder's exports directory.",
+    "export_filename_template": "Placeholders: {project_slug}, {index} (e.g. {index:02d}) and {title_slug}.",
+    "auto_open_folder": "Open the export folder after a clip is exported (desktop app only).",
+    "keep_source_video": "When off, Clean up also deletes the source video of projects whose clips are all rendered.",
+    "cache_transcripts": "Re-analysing the same video with the same speech settings skips speech recognition.",
+    "cache_downloads": "Keep downloaded videos so another project from the same link starts instantly.",
+    "cleanup_days": "Clean up removes cached downloads and unfinished projects older than this.",
+    "max_cache_gb": "Clean up trims the download cache to this size, oldest first.",
+    "uploads_enabled": "Allow uploading video files from the browser.",
+    "max_upload_gb": "Largest accepted upload.",
+}
+
+# Fields that exist for compatibility but have no effect in this version, plus
+# purely informational ones; the UI does not offer them.
+HIDDEN_FIELDS: frozenset[str] = frozenset({"telemetry", "translation_language", "vision_enabled", "vision_model", "min_word_confidence"})
+
+
 def _field_schema() -> dict[str, Any]:
     schema: dict[str, Any] = {}
     settings = get_settings()
+    values = settings.model_dump()
+    local_paths = Env.local_paths_allowed()
     for name, field in AppSettings.model_fields.items():
+        if name in HIDDEN_FIELDS:
+            continue
         annotation = field.annotation
         origin = getattr(annotation, "__origin__", None)
         options: list[Any] = []
@@ -158,18 +228,35 @@ def _field_schema() -> dict[str, Any]:
                 if value is not None:
                     constraints[attribute] = value
 
+        default = field.get_default(call_default_factory=True)
         schema[name] = {
             "name": name,
             "label": FIELD_LABELS.get(name, name.replace("_", " ").capitalize()),
             "type": kind,
             "options": options,
-            "default": field.default if not hasattr(field.default, "model_dump") else field.default.model_dump(),
-            "value": settings.model_dump().get(name),
+            "default": default.model_dump() if hasattr(default, "model_dump") else default,
+            "value": values.get(name),
             "section": next((section for section, fields in SECTION_FIELDS.items() if name in fields), "advanced"),
-            "help": (field.description or "").strip(),
+            "help": FIELD_HELP.get(name, (field.description or "").strip()),
+            "readonly": name in SERVER_PATH_FIELDS and not local_paths,
             **constraints,
         }
     return schema
+
+
+def _guard_server_paths(patch: dict[str, Any]) -> None:
+    """Server paths may only change when local-path features are allowed."""
+    if Env.local_paths_allowed():
+        return
+    current = get_settings().model_dump()
+    blocked = sorted(key for key in SERVER_PATH_FIELDS if key in patch and patch[key] != current.get(key))
+    if blocked:
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message=f"{', '.join(blocked)} cannot be changed on this server.",
+            hint="These settings point at files on the server. Set CLIPFORGE_ALLOW_LOCAL_PATHS=true to allow it.",
+            status_code=403,
+        )
 
 
 @router.get("/settings")
@@ -194,15 +281,8 @@ def update_settings(payload: dict[str, Any] = Body(...)):  # noqa: B008
     if not isinstance(payload, dict):
         raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message="Settings payload must be an object.", status_code=422)
     patch = {key: value for key, value in payload.items() if value is not None}
-    try:
-        updated = settings_store().update(patch)
-    except ValidationError as exc:
-        raise ClipForgeError(
-            code=ErrorCode.INVALID_INPUT,
-            message="Some settings were rejected.",
-            hint="; ".join(f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in exc.errors()[:4]),
-            status_code=422,
-        ) from exc
+    _guard_server_paths(patch)
+    updated = settings_store().update(patch)  # raises a friendly 422 for invalid values
     invalidate_cache()
     events.publish("settings.updated", {"settings": updated.to_public_dict()})
     return {"settings": updated.to_public_dict(), "updated": sorted(patch.keys())}
@@ -210,7 +290,12 @@ def update_settings(payload: dict[str, Any] = Body(...)):  # noqa: B008
 
 @router.post("/settings/reset")
 def reset_settings():
-    updated = settings_store().reset()
+    store = settings_store()
+    if Env.local_paths_allowed():
+        updated = store.reset()
+    else:  # keep the server's path configuration; reset everything else
+        current = store.current.model_dump()
+        updated = store.update({**AppSettings().model_dump(), **{key: current[key] for key in SERVER_PATH_FIELDS}})
     invalidate_cache()
     events.publish("settings.updated", {"settings": updated.to_public_dict(), "reset": True})
     return {"settings": updated.to_public_dict()}
@@ -286,7 +371,10 @@ def apply_template(template_id: str, project_id: str = Query("")):
             raise not_found("Template", template_id)
         config = json.loads(template.config_json or "{}")
 
-    settings = settings_store().update({key: value for key, value in config.items() if key in AppSettings.model_fields})
+    patch = {key: value for key, value in config.items() if key in AppSettings.model_fields}
+    if not Env.local_paths_allowed():
+        patch = {key: value for key, value in patch.items() if key not in SERVER_PATH_FIELDS}
+    settings = settings_store().update(patch)
     if project_id:
         from ...services.projects import merge_project_options
 

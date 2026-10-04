@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import shutil
+import json
 import tempfile
 from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Body, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
 
 from ...config import Env, get_settings
 from ...errors import ClipForgeError, ErrorCode
@@ -15,11 +16,40 @@ from ...jobs.manager import manager
 from ...logging_setup import get_logger
 from ...services import events
 from ...services import projects as project_service
-from ..schemas import AnalyzeRequest, ClipOptions, ProjectCreate
+from ...system import open_in_file_manager
 from ..media import stream_file
+from ..schemas import AnalyzeRequest, ClipOptions, ProjectAnalyzeRequest, ProjectCreate, RenderAllRequest, local_media_path
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+# Short aliases documented in the README (same handlers as the resource routes).
+shortcuts = APIRouter(tags=["projects"])
 log = get_logger(__name__)
+
+
+def _create_from_link(url: str, *, title: str = "", options: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Create a project from a pasted link - or, on the desktop app, a local file path."""
+    local = local_media_path(url)
+    if local is not None:
+        from ...media.download import ALLOWED_UPLOAD_EXTENSIONS
+
+        if local.suffix.lower() not in ALLOWED_UPLOAD_EXTENSIONS:
+            raise ClipForgeError(
+                code=ErrorCode.UNSUPPORTED_FORMAT,
+                message=f"{local.suffix or 'That file type'} cannot be analysed.",
+                hint="Supported: " + ", ".join(sorted(ALLOWED_UPLOAD_EXTENSIONS)),
+                status_code=422,
+            )
+        return project_service.create_project(title=title or local.stem, source_type="upload", options=options, source_path=local)
+
+    from ...media.download import classify_url
+
+    source = classify_url(url)
+    return project_service.create_project(
+        url=source.url,
+        title=title,
+        source_type="youtube" if source.is_youtube else "url",
+        options=options,
+    )
 
 
 @router.post("", status_code=201)
@@ -32,41 +62,8 @@ def create_project(payload: ProjectCreate):
             hint="Paste a YouTube, Vimeo or direct .mp4 link - or upload a file with POST /api/projects/upload.",
             status_code=422,
         )
-
-    # A link that points at a file on this machine is imported, not downloaded.
-    local = Path(payload.url).expanduser()
-    if local.is_file():
-        from ...media.download import ALLOWED_UPLOAD_EXTENSIONS
-
-        if local.suffix.lower() not in ALLOWED_UPLOAD_EXTENSIONS:
-            raise ClipForgeError(
-                code=ErrorCode.UNSUPPORTED_FORMAT,
-                message=f"{local.suffix or 'That file type'} cannot be analysed.",
-                hint="Supported: " + ", ".join(sorted(ALLOWED_UPLOAD_EXTENSIONS)),
-                status_code=422,
-            )
-        project = project_service.create_project(
-            title=payload.title or local.stem,
-            source_type="upload",
-            options=payload.options.to_settings_patch(),
-            source_path=local,
-        )
-        job = manager().enqueue_analysis(project["id"], priority=payload.priority) if payload.analyze else None
-        return {"project": project, "job": job}
-
-    from ...media.download import classify_url
-
-    source = classify_url(payload.url)
-    options = payload.options.to_settings_patch()
-    project = project_service.create_project(
-        url=source.url,
-        title=payload.title,
-        source_type=payload.source_type or ("youtube" if source.is_youtube else "url"),
-        options=options,
-    )
-    job = None
-    if payload.analyze:
-        job = manager().enqueue_analysis(project["id"], priority=payload.priority)
+    project = _create_from_link(payload.url, title=payload.title, options=payload.options.to_settings_patch())
+    job = manager().enqueue_analysis(project["id"], priority=payload.priority) if payload.analyze else None
     return {"project": project, "job": job}
 
 
@@ -77,54 +74,78 @@ async def upload_project(
     options: str = Form(""),
     analyze: str = Form("true"),
 ):
-    """Analyse a local file instead of a link."""
+    """Analyse a local file instead of a link (multipart upload)."""
+    from ...media.download import ALLOWED_UPLOAD_EXTENSIONS
+
     settings = get_settings()
     if not settings.uploads_enabled:
+        await file.close()
         raise ClipForgeError(
             code=ErrorCode.INVALID_INPUT,
-            message="Uploads are disabled in Settings -> Storage.",
+            message="Uploads are disabled in Settings -> Downloads & uploads.",
             status_code=403,
         )
-    import json
 
     parsed_options = ClipOptions()
     if options:
         try:
             parsed_options = ClipOptions.model_validate(json.loads(options))
-        except Exception as exc:  # noqa: BLE001
+        except (ValueError, TypeError) as exc:
+            await file.close()
             raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message=f"Invalid options: {exc}", status_code=422) from exc
 
-    suffix = Path(file.filename or "upload.mp4").suffix.lower()
-    limit = int(settings.max_upload_gb * 1024**3)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(Env.DATA_DIR / "cache")) as handle:
-        temp_path = Path(handle.name)
-        written = 0
-        while chunk := await file.read(1024 * 1024 * 4):
-            written += len(chunk)
-            if written > limit:
-                handle.close()
-                temp_path.unlink(missing_ok=True)
-                raise ClipForgeError(
-                    code=ErrorCode.UPLOAD_TOO_LARGE,
-                    message=f"That file is larger than the {settings.max_upload_gb:g} GB upload limit.",
-                    hint="Raise the limit in Settings -> Storage, or upload a smaller file.",
-                    status_code=413,
-                )
-            handle.write(chunk)
+    filename = Path(file.filename or "upload.mp4").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_UPLOAD_EXTENSIONS:
+        await file.close()
+        raise ClipForgeError(
+            code=ErrorCode.UNSUPPORTED_FORMAT,
+            message=f"{suffix or 'That file type'} cannot be analysed.",
+            hint="Supported: " + ", ".join(sorted(ALLOWED_UPLOAD_EXTENSIONS)),
+            status_code=422,
+        )
 
+    limit = int(settings.max_upload_gb * 1024**3)
+    cache = Env.DATA_DIR / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(cache), prefix="upload_") as handle:
+        temp_path = Path(handle.name)
+        try:
+            while chunk := await file.read(1024 * 1024 * 4):
+                written += len(chunk)
+                if written > limit:
+                    raise ClipForgeError(
+                        code=ErrorCode.UPLOAD_TOO_LARGE,
+                        message=f"That file is larger than the {settings.max_upload_gb:g} GB upload limit.",
+                        hint="Raise the limit in Settings -> Downloads & uploads, or upload a smaller file.",
+                        status_code=413,
+                    )
+                handle.write(chunk)
+        except BaseException:
+            handle.close()
+            temp_path.unlink(missing_ok=True)
+            await file.close()
+            raise
+
+    # Give the stored file its real name (the temp name is meaningless).
+    named = temp_path.with_name(f"{temp_path.stem}_{filename}")
     try:
+        temp_path.rename(named)
         project = project_service.create_project(
-            title=title or Path(file.filename or "Upload").stem,
+            title=title or Path(filename).stem,
             source_type="upload",
             options=parsed_options.to_settings_patch(),
-            source_path=temp_path,
+            source_path=named,
+            move_source=True,
         )
     finally:
         temp_path.unlink(missing_ok=True)
+        named.unlink(missing_ok=True)
         await file.close()
 
     job = None
-    if analyze.lower() not in {"false", "0", "no"}:
+    if analyze.strip().lower() not in {"false", "0", "no", "off"}:
         job = manager().enqueue_analysis(project["id"])
     return {"project": project, "job": job}
 
@@ -229,34 +250,35 @@ def get_clips(
 
 
 @router.post("/analyze")
+@shortcuts.post("/analyze", summary="Analyze (alias of POST /api/projects/analyze)")
 def analyze(payload: AnalyzeRequest):
-    """Start (or restart) the analysis pipeline for a project."""
+    """Start (or restart) the analysis for ``project_id`` - or create a project from ``url`` and analyse it."""
     project_id = payload.project_id
-    if not project_id and payload.url:
-        project = project_service.create_project(
-            url=payload.url,
-            options=(payload.options or ClipOptions()).to_settings_patch(),
-        )
+    if project_id:
+        project_service.project_detail(project_id)  # 404 for unknown ids
+        if payload.options is not None:
+            project_service.merge_project_options(project_id, payload.options.to_settings_patch())
+    elif payload.url:
+        project = _create_from_link(payload.url, title=payload.title, options=(payload.options or ClipOptions()).to_settings_patch())
         project_id = project["id"]
-    if not project_id:
+    else:
         raise ClipForgeError(
             code=ErrorCode.INVALID_INPUT,
             message="Provide a project_id or a url to analyse.",
             status_code=422,
         )
-    if payload.options is not None:
-        project_service.merge_project_options(project_id, payload.options.to_settings_patch())
-    job = manager().enqueue_analysis(project_id, priority=payload.priority)
+    job = manager().enqueue_analysis(project_id, priority=payload.priority, force=payload.force)
     return {"project_id": project_id, "job": job, "status": project_service.project_status(project_id)}
 
 
 @router.post("/{project_id}/analyze")
-def analyze_project(project_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
-    body = payload or {}
-    options = body.get("options")
-    if options:
-        project_service.merge_project_options(project_id, options)
-    job = manager().enqueue_analysis(project_id, priority=int(body.get("priority", 1)))
+def analyze_project(project_id: str, payload: ProjectAnalyzeRequest | None = Body(default=None)):  # noqa: B008
+    """Re-run the analysis, optionally with new clip options for this project."""
+    body = payload or ProjectAnalyzeRequest()
+    project_service.project_detail(project_id)  # 404 for unknown ids
+    if body.options is not None:
+        project_service.merge_project_options(project_id, body.options.to_settings_patch())
+    job = manager().enqueue_analysis(project_id, priority=body.priority, force=body.force)
     return {"project_id": project_id, "job": job}
 
 
@@ -268,19 +290,36 @@ def cancel_project(project_id: str):
 
 
 @router.post("/{project_id}/render-all")
-def render_all(project_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
-    body = payload or {}
+def render_all(project_id: str, payload: RenderAllRequest | None = Body(default=None)):  # noqa: B008
+    """Queue renders for a project's clips.
+
+    Without ``clip_ids`` only clips that still need a render are queued
+    (rendered, queued and rendering clips are skipped unless ``force``).
+    """
+    body = payload or RenderAllRequest()
     clips = project_service.project_clips(project_id, sort="score")["clips"]
-    clip_ids = body.get("clip_ids") or [clip["id"] for clip in clips]
-    if not clip_ids:
+    if not clips:
         raise ClipForgeError(
             code=ErrorCode.NO_CANDIDATES,
             message="This project has no clips to render yet.",
             hint="Run the analysis first.",
             status_code=409,
         )
-    result = manager().enqueue_all(project_id, clip_ids, export=bool(body.get("export", False)))
-    return {**result, "queue": job_queue.queue_state(project_id)}
+    known = {clip["id"]: clip for clip in clips}
+    if body.clip_ids:
+        unknown = [clip_id for clip_id in body.clip_ids if clip_id not in known]
+        if unknown:
+            raise ClipForgeError(
+                code=ErrorCode.NOT_FOUND,
+                message=f"{len(unknown)} of those clips do not belong to this project.",
+                status_code=404,
+            )
+        clip_ids = list(dict.fromkeys(body.clip_ids))
+    else:
+        skip = {"queued", "rendering"} | (set() if body.force else {"rendered"})
+        clip_ids = [clip["id"] for clip in clips if clip.get("status") not in skip]
+    result = manager().enqueue_all(project_id, clip_ids, export=body.export)
+    return {**result, "skipped": len(clips) - len(clip_ids) if not body.clip_ids else 0, "queue": job_queue.queue_state(project_id)}
 
 
 @router.get("/{project_id}/queue")
@@ -317,33 +356,13 @@ def delete_project(project_id: str, remove_files: bool = Query(True)):
 
 @router.post("/{project_id}/open-folder")
 def open_folder(project_id: str):
-    """Open the project's render folder in the OS file manager (local app nicety)."""
-    import subprocess
-    import sys
-
+    """Open the project's render folder in the OS file manager (desktop app only)."""
     from ...pipeline.context import ProjectPaths
 
     detail = project_service.project_detail(project_id)
-    paths = ProjectPaths.for_snapshot(detail).ensure()
-    target = paths.renders
-    try:
-        if sys.platform.startswith("win"):
-            import os
-
-            os.startfile(str(target))  # type: ignore[attr-defined]  # noqa: S606
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(target)])  # noqa: S603,S607
-        else:
-            subprocess.Popen(["xdg-open", str(target)])  # noqa: S603,S607
-    except Exception as exc:  # noqa: BLE001 - headless environments
-        raise ClipForgeError(
-            code=ErrorCode.INTERNAL,
-            message="Could not open the folder automatically.",
-            hint=f"Open it manually: {target}",
-            detail=str(exc),
-            status_code=501,
-        ) from exc
+    target = ProjectPaths.for_snapshot(detail).ensure().renders
+    open_in_file_manager(target)
     return {"opened": str(target)}
 
 
-__all__ = ["router"]
+__all__ = ["router", "shortcuts"]

@@ -5,15 +5,15 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..ai.language import language_name
-from ..config import AppSettings, get_settings
+from ..config import AppSettings, merge_settings_patch
 from ..constants import STAGES, stage_public_list
-from ..db import Candidate, Clip, Job, Project, TranscriptSegment, session_scope, slugify, utcnow
-from ..errors import ClipForgeError, ErrorCode, not_found
+from ..db import Candidate, Clip, Job, Project, TranscriptSegment, session_scope, slugify
+from ..errors import not_found
 from ..logging_setup import get_logger
 from ..media.download import classify_url, parse_youtube_url
 from ..pipeline.context import ProjectPaths, find_media
@@ -34,8 +34,13 @@ def create_project(
     source_type: str = "youtube",
     options: dict[str, Any] | None = None,
     source_path: Path | None = None,
+    move_source: bool = False,
 ) -> dict[str, Any]:
-    """Create a project row (no analysis yet)."""
+    """Create a project row (no analysis yet).
+
+    ``source_path`` (uploads and local imports) is copied into the project -
+    or moved, with ``move_source``, when it is a temporary upload file.
+    """
     if source_type == "youtube":
         video_id = parse_youtube_url(url)
     elif source_type == "url":
@@ -82,7 +87,10 @@ def create_project(
 
         target = safe_upload_path(paths.source, source_path.name)
         if source_path.resolve() != target.resolve():
-            shutil.copy2(source_path, target)
+            if move_source:
+                shutil.move(str(source_path), str(target))
+            else:
+                shutil.copy2(source_path, target)
 
     log.info("created project %s (%s)", project_id, name[:60])
     events.publish("project.created", {"project": snapshot}, project_id=project_id)
@@ -110,8 +118,8 @@ def merge_project_options(project_id: str, options: dict[str, Any]) -> dict[str,
         project = session.get(Project, project_id)
         if project is None:
             raise not_found("Project", project_id)
-        current = project.settings
-        current.update({key: value for key, value in options.items() if value is not None})
+        patch = {key: value for key, value in options.items() if value is not None and key in AppSettings.model_fields}
+        current = merge_settings_patch(project.settings, patch)
         project.settings_json = json.dumps(current)
         session.flush()
         return current
@@ -124,28 +132,42 @@ def merge_project_options(project_id: str, options: dict[str, Any]) -> dict[str,
 
 def list_projects(*, search: str = "", limit: int = 100, offset: int = 0) -> dict[str, Any]:
     with session_scope() as session:
-        query = select(Project).order_by(Project.created_at.desc())
+        query = select(Project)
         if search:
-            like = f"%{search.lower()}%"
-            query = query.where(Project.title.ilike(like))
-        projects = session.execute(query.offset(offset).limit(limit)).scalars().all()
+            query = query.where(Project.title.ilike(f"%{search.strip()}%"))
+        total = session.execute(select(func.count()).select_from(query.subquery())).scalar_one()
+        projects = session.execute(query.order_by(Project.created_at.desc()).offset(offset).limit(limit)).scalars().all()
+        ids = [project.id for project in projects]
+
+        clip_counts: dict[str, dict[str, int]] = {}
+        active: dict[str, dict[str, Any]] = {}
+        if ids:
+            rows = session.execute(
+                select(Clip.project_id, Clip.status, func.count(Clip.id)).where(Clip.project_id.in_(ids)).group_by(Clip.project_id, Clip.status)
+            ).all()
+            for project_id, status, count in rows:
+                clip_counts.setdefault(project_id, {})[status] = count
+            jobs = session.execute(
+                select(Job).where(Job.project_id.in_(ids), Job.status.in_(("queued", "running"))).order_by(Job.created_at.asc())
+            ).scalars().all()
+            for job in jobs:
+                current = active.get(job.project_id)
+                if current is None or (job.status == "running" and current["status"] != "running"):
+                    active[job.project_id] = job.to_dict(with_log=False)
+
         items = []
         for project in projects:
-            clashed = session.execute(select(Clip).where(Clip.project_id == project.id)).scalars().all()
-            updated = sum(1 for clip in clashed if clip.status == "rendered")
-            active = session.execute(
-                select(Job).where(Job.project_id == project.id, Job.status.in_(("queued", "running"))).limit(1)
-            ).scalars().first()
+            counts = clip_counts.get(project.id, {})
+            rendered = counts.get("rendered", 0)
             items.append(
                 {
                     **project.to_dict(),
-                    "rendered_clips": updated,
-                    "pending_clips": len(clashed) - updated,
-                    "active_job": active.to_dict(with_log=False) if active else None,
+                    "rendered_clips": rendered,
+                    "pending_clips": sum(counts.values()) - rendered,
+                    "active_job": active.get(project.id),
                 }
             )
-        total = session.execute(select(Project)).scalars().all()
-    return {"projects": items, "total": len(total)}
+    return {"projects": items, "total": int(total)}
 
 
 def project_detail(project_id: str) -> dict[str, Any]:
@@ -170,6 +192,7 @@ def project_detail(project_id: str) -> dict[str, Any]:
         "language_name": language_name(payload.get("language", "")),
         "paths": paths.to_dict(),
         "source_file": str(media_path) if media_path else "",
+        "has_source": media_path is not None,
         "clips": [clip.to_dict() for clip in clips],
         "candidate_count_stored": len(candidates),
         "jobs": [job.to_dict(with_log=False) for job in jobs],
@@ -199,11 +222,16 @@ def project_status(project_id: str) -> dict[str, Any]:
 
     stage_states = _stage_states(payload, job_payload)
     rendered = sum(1 for clip in clip_rows if clip.status == "rendered")
+    has_source = find_media(ProjectPaths.for_snapshot(payload).source) is not None
     return {
         "project": {
             "id": payload["id"],
             "title": payload["title"],
             "channel": payload["channel"],
+            "source_type": payload["source_type"],
+            "source_url": payload["source_url"],
+            "has_source": has_source,
+            "word_count": payload["word_count"],
             "status": payload["status"],
             "stage": payload["stage"],
             "progress": payload["progress"],
@@ -385,6 +413,14 @@ def project_clips(
 
 def delete_project(project_id: str, *, remove_files: bool = True) -> dict[str, Any]:
     with session_scope() as session:
+        if session.get(Project, project_id) is None:
+            raise not_found("Project", project_id)
+    # Stop the project's work first: a running analysis or render would keep
+    # writing into the folder that is about to disappear.
+    from ..jobs.manager import manager
+
+    manager().cancel_project(project_id)
+    with session_scope() as session:
         project = session.get(Project, project_id)
         if project is None:
             raise not_found("Project", project_id)
@@ -427,47 +463,7 @@ def project_disk_usage(project_id: str) -> dict[str, Any]:
     return {"project_id": project_id, "root": str(paths.root), "total_bytes": total, "breakdown": breakdown}
 
 
-def cleanup_projects(*, keep_days: int | None = None, remove_renders_only: bool = False) -> dict[str, Any]:
-    """Housekeeping used by the Storage settings panel."""
-    settings = get_settings()
-    days = keep_days if keep_days is not None else settings.cleanup_days
-    cutoff = utcnow().timestamp() - max(days, 1) * 86400
-    removed_cache = 0
-    freed = 0
-
-    cache_root = settings.resolved_export_dir().parent / "cache"
-    if cache_root.exists():
-        for path in cache_root.rglob("*"):
-            try:
-                if path.is_file() and path.stat().st_mtime < cutoff:
-                    freed += path.stat().st_size
-                    path.unlink()
-                    removed_cache += 1
-            except OSError:
-                continue
-
-    removed_projects: list[str] = []
-    if not remove_renders_only:
-        with session_scope() as session:
-            stale = [
-                project.to_dict()
-                for project in session.execute(select(Project)).scalars().all()
-                if project.updated_at and project.updated_at.timestamp() < cutoff and project.status in {"draft", "failed", "cancelled"}
-            ]
-        for snapshot in stale:
-            delete_project(snapshot["id"])
-            removed_projects.append(snapshot["id"])
-
-    return {
-        "cache_files_removed": removed_cache,
-        "bytes_freed": freed,
-        "projects_removed": removed_projects,
-        "cutoff_days": days,
-    }
-
-
 __all__ = [
-    "cleanup_projects",
     "create_project",
     "delete_project",
     "list_projects",

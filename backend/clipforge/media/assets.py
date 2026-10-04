@@ -17,7 +17,7 @@ import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from ..config import AppSettings, Env, get_settings
 from ..db import Asset, session_scope
@@ -100,9 +100,16 @@ def import_asset(
     name: str = "",
     tags: Sequence[str] = (),
     copy: bool = True,
+    move: bool = False,
+    filename: str = "",
     probe: bool = True,
-) -> Asset:
-    """Import a file into the library and register it in the database."""
+) -> dict[str, Any]:
+    """Import a file into the library and register it in the database.
+
+    ``copy`` copies the file into the library folder (``False`` registers it in
+    place); ``move`` moves it there instead (used for finished uploads), and
+    ``filename`` names the library copy when the source has a temporary name.
+    """
     if kind not in {"gameplay", "broll", "music"}:
         raise invalid_input(f"Unknown asset kind: {kind}")
     allowed = IMAGE_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
@@ -116,7 +123,7 @@ def import_asset(
     category = _safe_category(kind, category)
     target_dir = assets_root() / kind / category
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / _sanitize(source.name)
+    target = target_dir / _sanitize(Path(filename).name if filename else source.name)
     if target.exists() and target.resolve() != source.resolve():
         stem, suffix = target.stem, target.suffix
         index = 2
@@ -124,7 +131,9 @@ def import_asset(
             target = target_dir / f"{stem}_{index}{suffix}"
             index += 1
 
-    if copy:
+    if move:
+        shutil.move(str(source), str(target))
+    elif copy:
         shutil.copy2(source, target)
     else:
         target = source
@@ -165,7 +174,7 @@ def import_asset(
         session.flush()
         payload = asset.to_dict()
     log.info("imported %s asset '%s' (%s)", kind, target.name, category)
-    return payload  # type: ignore[return-value]
+    return payload
 
 
 def _safe_category(kind: str, category: str) -> str:
@@ -233,7 +242,6 @@ def library_summary() -> dict[str, Any]:
 
 
 def delete_asset(asset_id: str, *, remove_file: bool = True) -> bool:
-    from sqlalchemy import select
 
     with session_scope() as session:
         asset = session.get(Asset, asset_id)

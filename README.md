@@ -144,7 +144,7 @@ timestamped `.txt`) attached to a project are used instead of ASR.
 optional WhisperX alignment + diarization, and a numpy-based acoustic diarizer (pitch, MFCC-style
 features, k-means) that always works without extra downloads. Language detection understands
 Hindi / English / Hinglish / mixed-script audio and **never translates unless you switch translation
-on** — you can also force a language in Settings.
+on** (*Translate to English* uses Whisper's translation task) — you can also force a language in Settings.
 
 **Editing** — silence removal with natural pauses preserved (default: drop > 0.35 s), smart reframing
 and speaker tracking, split-screen layouts (50/50, 60/40, 65/35, 70/30), speaker-full-frame,
@@ -193,11 +193,16 @@ DELETE /api/projects/{id}
 GET    /api/clips/{id}            PATCH /api/clips/{id}      DELETE /api/clips/{id}
 POST   /api/clips/{id}/render | /preview | /cancel | /regenerate | /duplicate
 GET    /api/clips/{id}/captions | /captions/srt | /command | /preview | /file | /thumbnail | /subtitles | /assets
-POST   /api/clips/render-all
+POST   /api/clips/render-all      POST /api/captions/preview   (caption style preview, no clip needed)
 GET    /api/assets[/gameplay|/broll|/music|/folders]      POST /api/assets/upload | /import-path | /scan
-GET    /api/jobs | /jobs/queue | /workers                 POST /api/jobs/{id}/cancel | /retry | /retry-failed | /purge
-GET    /api/events                (SSE: job + clip progress)
+GET    /api/jobs | /jobs/{id} | /jobs/queue | /workers    POST /api/jobs/{id}/cancel | /retry | /retry-failed | /purge
+GET    /api/system/storage        POST /api/system/cleanup   ({"days", "renders", "dry_run"})
+GET    /api/events                (SSE: job, clip and project events; heartbeat every 15 s)
 ```
+
+`POST /api/projects/{id}/render-all` queues only the clips that still need a render unless you pass
+`clip_ids` or `"force": true`. Creation options are stored per project only when you send them; anything
+you leave out keeps following the global Settings.
 
 Errors are always structured and safe to display:
 
@@ -215,11 +220,24 @@ Errors are always structured and safe to display:
 `Settings` has nine sections (General, AI & analysis, Transcription, Video & clips, Captions, Gameplay
 & layouts, Audio, Export, Storage) and persists to SQLite — no config files to edit. Environment
 variables (`CLIPFORGE_DATA_DIR`, `CLIPFORGE_HOST`, `CLIPFORGE_PORT`, `CLIPFORGE_FFMPEG`,
-`CLIPFORGE_LOG_LEVEL`, …) override the defaults; see `backend/.env.example`.
+`CLIPFORGE_LOG_LEVEL`, `CLIPFORGE_ALLOW_LOCAL_PATHS`, …) override the defaults; see `backend/.env.example`.
 
 Locally hosted means locally safe: the server binds to `127.0.0.1` by default, media streaming is
 restricted to the data directory, uploads are size-limited and sanitised, and FFmpeg always runs from
 an argument vector (never a shell string).
+
+**Hosting it on a server.** When `CLIPFORGE_HOST` is not a loopback address (e.g. `0.0.0.0` on Render or
+Docker), features that touch the server's own filesystem are switched off: importing a file by path,
+opening folders, and changing path settings (export folder, ffmpeg/ffprobe, cookies, model cache).
+Uploads work as usual. Set `CLIPFORGE_ALLOW_LOCAL_PATHS=true` only on a machine you control. Whisper
+models that would not fit in the container's memory limit are swapped for the largest one that does,
+and the job log says so. Running the UI with `next start` proxies every request under `/api` to
+`CLIPFORGE_API`.
+
+**Storage.** *Settings → Storage → Clean up now* (or `POST /api/system/cleanup`) removes cached
+downloads and unfinished projects older than `cleanup_days`, trims the download cache to `max_cache_gb`,
+optionally deletes old renders (the clips can be re-rendered), and — with *Keep the source video* off —
+deletes the sources of fully rendered projects. Expired caches are also trimmed on every start.
 
 ---
 
