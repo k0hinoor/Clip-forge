@@ -231,7 +231,8 @@ Docker), features that touch the server's own filesystem are switched off: impor
 opening folders, and changing path settings (export folder, ffmpeg/ffprobe, cookies, model cache).
 Uploads work as usual. Set `CLIPFORGE_ALLOW_LOCAL_PATHS=true` only on a machine you control. Whisper
 models that would not fit in the container's memory limit are swapped for the largest one that does,
-and the job log says so. Running the UI with `next start` proxies `/api/*` to `CLIPFORGE_API`.
+and the job log says so. Running the UI with `next start` proxies every request under `/api` to
+`CLIPFORGE_API`.
 
 **Storage.** *Settings → Storage → Clean up now* (or `POST /api/system/cleanup`) removes cached
 downloads and unfinished projects older than `cleanup_days`, trims the download cache to `max_cache_gb`,
