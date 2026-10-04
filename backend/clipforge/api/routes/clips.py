@@ -1,167 +1,240 @@
-"""Clip routes (TRD §28.4): review, manual correction, re-render, downloads."""
+"""Clip routes: detail, edit, captions, render, preview, regenerate, export."""
 
 from __future__ import annotations
 
-from typing import Any
+from fastapi import APIRouter, Body, Query, Request
+from fastapi.responses import PlainTextResponse
 
-from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import FileResponse, RedirectResponse, Response
-from sqlalchemy import select
-from sqlalchemy.orm import Session
-
-from clipforge.api.deps import (
-    client_ip,
-    current_user,
-    get_auth,
-    get_db,
-    get_queue_dep,
-    get_settings_dep,
-    get_storage_dep,
-)
-from clipforge.api.schemas import ClipOut, ClipPatchRequest, ClipPatchResponse, RenderOut
-from clipforge.api.serializers import clip_out, render_out
-from clipforge.core.config import Settings
-from clipforge.core.errors import AppError, ErrorCode, not_found
-from clipforge.core.states import JobStatus, RenderStatus
-from clipforge.db.models import Clip, Job, Render, User
-from clipforge.queue.base import QueueProvider
-from clipforge.security.tokens import verify_resource_signature
-from clipforge.services.analytics import track
-from clipforge.services.audit import audit
-from clipforge.services.clips import ClipService
-from clipforge.storage import StorageProvider
+from ...errors import ClipForgeError, ErrorCode
+from ...jobs.manager import manager
+from ...logging_setup import get_logger
+from ...services import clips as clip_service
+from ...services import events
+from ..media import require_file, stream_file
+from ..schemas import CaptionPreviewRequest, ClipUpdate, RenderRequest
 
 router = APIRouter(prefix="/clips", tags=["clips"])
+log = get_logger(__name__)
 
 
-def _svc(db: Session, settings: Settings, storage: StorageProvider, queue: QueueProvider | None = None) -> ClipService:
-    return ClipService(db, settings, storage, queue)
+@router.post("/render-all")
+def render_all(payload: RenderRequest):
+    """Queue every requested clip for rendering."""
+    if not payload.clip_ids:
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message="No clips were selected.",
+            hint="Pass clip_ids, or use POST /api/projects/{id}/render-all.",
+            status_code=422,
+        )
+    project_id = ""
+    with_render = []
+    for clip_id in payload.clip_ids:
+        clip = clip_service.get_clip(clip_id)
+        project_id = project_id or clip["project_id"]
+        with_render.append(clip_id)
+    result = manager().enqueue_all(project_id, with_render, export=payload.export)
+    return {**result, "queue": _queue(project_id)}
 
 
-@router.get("/{clip_id}", response_model=ClipOut)
-def get_clip(clip_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-             settings: Settings = Depends(get_settings_dep),
-             storage: StorageProvider = Depends(get_storage_dep)) -> dict[str, Any]:
-    return clip_out(_svc(db, settings, storage).get(user, clip_id), db, settings)
+@router.get("/{clip_id}")
+def get_clip(clip_id: str):
+    return clip_service.clip_detail(clip_id)
 
 
-@router.patch("/{clip_id}", response_model=ClipPatchResponse)
-def patch_clip(clip_id: str, body: ClipPatchRequest, user: User = Depends(current_user),
-               db: Session = Depends(get_db), settings: Settings = Depends(get_settings_dep),
-               storage: StorageProvider = Depends(get_storage_dep),
-               queue: QueueProvider = Depends(get_queue_dep)) -> dict[str, Any]:
-    svc = _svc(db, settings, storage, queue)
-    clip = svc.get(user, clip_id)
-    patch = body.model_dump(exclude_unset=True, exclude={"render"})
-    clip, render_required = svc.update(user, clip, patch)
-    queued = False
-    job = db.get(Job, clip.job_id)
-    if render_required and body.render and job is not None and job.status == JobStatus.COMPLETED.value:
-        svc.request_render(user, clip)
-        queued = True
-    db.commit()
-    return {"clip": clip_out(clip, db, settings), "render_required": render_required, "render_queued": queued}
+@router.patch("/{clip_id}")
+def update_clip(clip_id: str, payload: ClipUpdate):
+    patch = payload.model_dump(exclude_none=True)
+    if not patch:
+        return clip_service.clip_detail(clip_id)
+    updated = clip_service.update_clip(clip_id, patch)
+    events.publish("clip.updated", {"clip_id": clip_id, "clip": updated}, project_id=updated["project_id"])
+    return updated
 
 
-@router.post("/{clip_id}/render", response_model=RenderOut, status_code=202)
-def render_clip(clip_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-                settings: Settings = Depends(get_settings_dep), storage: StorageProvider = Depends(get_storage_dep),
-                queue: QueueProvider = Depends(get_queue_dep)) -> dict[str, Any]:
-    svc = _svc(db, settings, storage, queue)
-    render = svc.request_render(user, svc.get(user, clip_id))
-    db.commit()
-    return render_out(render)
+@router.delete("/{clip_id}")
+def delete_clip(clip_id: str, remove_files: bool = Query(True)):
+    result = clip_service.delete_clip(clip_id, remove_files=remove_files)
+    events.publish("clip.deleted", {"clip_id": clip_id}, project_id=result.get("project_id", ""))
+    return result
 
 
-@router.get("/{clip_id}/renders", response_model=list[RenderOut])
-def list_renders(clip_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-                 settings: Settings = Depends(get_settings_dep),
-                 storage: StorageProvider = Depends(get_storage_dep)) -> list[dict[str, Any]]:
-    clip = _svc(db, settings, storage).get(user, clip_id)
-    rows = db.scalars(select(Render).where(Render.clip_id == clip.id).order_by(Render.created_at.desc())).all()
-    return [render_out(r) for r in rows]
+@router.post("/{clip_id}/render")
+def render_clip(clip_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
+    body = payload or {}
+    job = manager().enqueue_render(
+        clip_id,
+        export=bool(body.get("export", False)),
+        overrides=body.get("overrides") or None,
+    )
+    clip = clip_service.get_clip(clip_id)
+    return {"job": job, "clip_id": clip_id, "queue": _queue(clip["project_id"])}
 
 
-@router.delete("/{clip_id}", status_code=204)
-def delete_clip(clip_id: str, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db),
-                settings: Settings = Depends(get_settings_dep),
-                storage: StorageProvider = Depends(get_storage_dep)) -> None:
-    svc = _svc(db, settings, storage)
-    clip = svc.get(user, clip_id)
-    svc.delete(user, clip)
-    audit(db, "clip.deleted", actor_user_id=user.id, target_type="clip", target_id=clip.id,
-          ip_address=client_ip(request))
-    db.commit()
+@router.post("/{clip_id}/preview")
+def preview_clip(clip_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
+    """Render a fast low-resolution preview (separate from the final render)."""
+    body = payload or {}
+    job = manager().enqueue_preview(clip_id, priority=int(body.get("priority", 2)))
+    clip = clip_service.get_clip(clip_id)
+    return {"job": job, "clip_id": clip_id, "queue": _queue(clip["project_id"])}
 
 
-# ---------------------------------------------------------------- files
-VARIANTS = {"download": ("storage_key", "video/mp4"), "thumbnail": ("thumbnail_key", "image/jpeg"),
-            "subtitles": ("subtitles_key", "text/x-ssa")}
+@router.post("/{clip_id}/cancel")
+def cancel_clip_render(clip_id: str):
+    clip = clip_service.get_clip(clip_id)
+    from ...jobs import queue as job_queue
+
+    jobs = job_queue.list_jobs(project_id=clip["project_id"], statuses=("queued", "running"), limit=100)
+    cancelled = 0
+    for job in jobs:
+        if job.get("clip_id") == clip_id:
+            manager().cancel(job["id"])
+            cancelled += 1
+    return {"cancelled": cancelled, "clip_id": clip_id}
 
 
-def _resolve_download_user(request: Request, db: Session, clip_id: str, variant: str, render_id: str | None,
-                           expires: int | None, sig: str | None) -> tuple[Clip, Render]:
-    settings: Settings = request.app.state.settings
-    clip = db.scalar(select(Clip).where(Clip.id == clip_id, Clip.deleted_at.is_(None)))
-    if clip is None:
-        raise not_found("Clip")
-    if sig and expires and render_id:
-        if not verify_resource_signature(settings.JWT_SECRET, "clip", clip_id, f"{variant}:{render_id}",
-                                         int(expires), sig):
-            raise AppError(ErrorCode.FORBIDDEN, "This link is invalid or has expired.")
-    else:
-        auth = get_auth(request, db)
-        if clip.user_id != auth.user.id:
-            raise not_found("Clip")
-    rid = render_id or clip.current_render_id
-    render = db.get(Render, rid) if rid else None
-    if render is None or render.clip_id != clip.id or render.status != RenderStatus.READY.value:
-        raise not_found("Render")
-    return clip, render
+@router.post("/{clip_id}/regenerate")
+def regenerate_clip(clip_id: str, payload: dict | None = Body(default=None)):  # noqa: B008
+    """Re-examine the neighbourhood and keep the strongest moment in it."""
+    body = payload or {}
+    result = clip_service.regenerate_clip(
+        clip_id,
+        window=float(body.get("window", 120.0)),
+        use_llm=bool(body.get("use_llm", True)),
+    )
+    events.publish("clip.regenerated", {"clip_id": clip_id, "clip": result}, project_id=result["project_id"])
+    return result
 
 
-def _serve(variant: str, clip_id: str, request: Request, db: Session, r: str | None, expires: int | None,
-           sig: str | None, storage: StorageProvider) -> Response:
-    clip, render = _resolve_download_user(request, db, clip_id, variant, r, expires, sig)
-    attr, media_type = VARIANTS[variant]
-    key = getattr(render, attr)
-    if not key or not storage.exists(key):
-        raise AppError(ErrorCode.NOT_FOUND, "This file has expired or was deleted.")
-    filename = render.filename if variant == "download" else None
-    if variant == "subtitles" and render.filename:
-        filename = render.filename.rsplit(".", 1)[0] + ".ass"
-    if variant == "download":
-        track(db, "clip_downloaded", user_id=clip.user_id, job_id=clip.job_id, clip_id=clip.id)
-        db.commit()
-    local = storage.local_path(key)
-    if local is None:
-        url = storage.signed_url(key, 300, filename=filename)
-        if url is None:
-            raise AppError(ErrorCode.NOT_FOUND)
-        return RedirectResponse(url, status_code=307)
-    headers = {"Cache-Control": "private, max-age=300"}
-    if variant == "download":
-        return FileResponse(local, media_type=media_type, filename=filename, headers=headers)
-    return FileResponse(local, media_type=media_type, headers=headers,
-                        content_disposition_type="inline", filename=filename)
+@router.post("/{clip_id}/duplicate")
+def duplicate_clip(clip_id: str):
+    from ...db import Clip, session_scope
+
+    detail = clip_service.clip_detail(clip_id)
+    with session_scope() as session:
+        original = session.get(Clip, clip_id)
+        if original is None:
+            raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Clip not found.", status_code=404)
+        clone = Clip(
+            project_id=original.project_id,
+            candidate_id=original.candidate_id,
+            index=original.index,
+            title=f"{original.title} (copy)"[:300],
+            hook=original.hook,
+            summary=original.summary,
+            category=original.category,
+            score=original.score,
+            why_json=original.why_json,
+            factors_json=original.factors_json,
+            start=original.start,
+            end=original.end,
+            duration=original.duration,
+            words_json=original.words_json,
+            segments_json=original.segments_json,
+            trim_json=original.trim_json,
+            layout_json=original.layout_json,
+            status="pending",
+        )
+        session.add(clone)
+        session.flush()
+        clone_id = clone.id
+    return clip_service.clip_detail(clone_id)
 
 
-@router.get("/{clip_id}/download")
-def download_clip(clip_id: str, request: Request, r: str | None = Query(default=None, max_length=36),
-                  expires: int | None = None, sig: str | None = Query(default=None, max_length=128),
-                  db: Session = Depends(get_db), storage: StorageProvider = Depends(get_storage_dep)) -> Response:
-    return _serve("download", clip_id, request, db, r, expires, sig, storage)
+@router.get("/{clip_id}/captions")
+def get_captions(clip_id: str, preset: str = Query(""), theme: str = Query("")):
+    import json
+
+    parsed = json.loads(theme) if theme else None
+    return clip_service.caption_preview(clip_id, preset=preset or None, theme=parsed)
+
+
+@router.post("/{clip_id}/captions/preview")
+def preview_captions(clip_id: str, payload: CaptionPreviewRequest):
+    return clip_service.caption_preview(clip_id, preset=payload.preset, theme=payload.theme)
+
+
+@router.get("/{clip_id}/captions/srt", response_class=PlainTextResponse)
+def download_srt(clip_id: str):
+    path = clip_service.write_clip_srt(clip_id)
+    return PlainTextResponse(path.read_text(encoding="utf-8-sig"), media_type="application/x-subrip")
+
+
+@router.get("/{clip_id}/command")
+def get_command(clip_id: str, quality: str = Query("final", pattern="^(final|preview)$")):
+    """The exact ffmpeg command this clip's render would run."""
+    return {"clip_id": clip_id, "quality": quality, "command": clip_service.render_spec_preview(clip_id, quality=quality)}
+
+
+@router.get("/{clip_id}/preview")
+def stream_preview(clip_id: str, request: Request):
+    detail = clip_service.get_clip(clip_id)
+    path = detail.get("has_preview") and None
+    with_path = clip_service.get_clip(clip_id)
+    target = _path_of(clip_id, "preview_path") or (with_path.get("render_url") and _path_of(clip_id, "file_path"))
+    if not target:
+        raise ClipForgeError(
+            code=ErrorCode.NOT_FOUND,
+            message="This clip has not been rendered yet.",
+            hint="Press Render (or Preview) to create the video.",
+            status_code=404,
+        )
+    return stream_file(require_file(target), request, cache_seconds=600)
+
+
+@router.get("/{clip_id}/file")
+def stream_file_route(clip_id: str, request: Request, download: bool = Query(False)):
+    target = _path_of(clip_id, "file_path")
+    if not target:
+        raise ClipForgeError(
+            code=ErrorCode.NOT_FOUND,
+            message="This clip has not been rendered yet.",
+            hint="Press Render to create the final video.",
+            status_code=404,
+        )
+    from pathlib import Path
+
+    path = require_file(target)
+    return stream_file(path, request, download_name=path.name if download else None, cache_seconds=3600)
 
 
 @router.get("/{clip_id}/thumbnail")
-def clip_thumbnail(clip_id: str, request: Request, r: str | None = Query(default=None, max_length=36),
-                   expires: int | None = None, sig: str | None = Query(default=None, max_length=128),
-                   db: Session = Depends(get_db), storage: StorageProvider = Depends(get_storage_dep)) -> Response:
-    return _serve("thumbnail", clip_id, request, db, r, expires, sig, storage)
+def stream_thumbnail(clip_id: str, request: Request):
+    target = _path_of(clip_id, "thumb_path")
+    if not target:
+        raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="No thumbnail for this clip yet.", status_code=404)
+    return stream_file(require_file(target), request, cache_seconds=86400)
 
 
 @router.get("/{clip_id}/subtitles")
-def clip_subtitles(clip_id: str, request: Request, r: str | None = Query(default=None, max_length=36),
-                   expires: int | None = None, sig: str | None = Query(default=None, max_length=128),
-                   db: Session = Depends(get_db), storage: StorageProvider = Depends(get_storage_dep)) -> Response:
-    return _serve("subtitles", clip_id, request, db, r, expires, sig, storage)
+def download_subtitles(clip_id: str):
+    target = _path_of(clip_id, "subtitle_path")
+    if not target:
+        raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="No subtitle file for this clip yet.", status_code=404)
+    path = require_file(target)
+    return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace"), media_type="text/plain; charset=utf-8")
+
+
+@router.get("/{clip_id}/assets")
+def clip_asset_options(clip_id: str):
+    return clip_service.clip_assets_options()
+
+
+def _path_of(clip_id: str, field: str) -> str:
+    from ...db import Clip, session_scope
+
+    with session_scope() as session:
+        clip = session.get(Clip, clip_id)
+        if clip is None:
+            raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Clip not found.", status_code=404)
+        return str(getattr(clip, field) or "")
+
+
+def _queue(project_id: str) -> dict:
+    from ...jobs import queue as job_queue
+
+    return job_queue.queue_state(project_id)
+
+
+__all__ = ["router"]

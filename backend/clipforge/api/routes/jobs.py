@@ -1,196 +1,137 @@
-"""Job routes (TRD §28.3) + SSE progress stream (TRD §29)."""
+"""Job/queue routes and the Server-Sent Events stream for live progress."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
-from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Query, Request
-from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Body, Query, Request
+from fastapi.responses import StreamingResponse
 
-from clipforge.api.deps import current_user, get_db, get_queue_dep, get_settings_dep, get_storage_dep
-from clipforge.api.schemas import ClipOut, JobCreateRequest, JobEventOut, JobListOut, JobOut
-from clipforge.api.serializers import clip_out, event_out, job_out
-from clipforge.core.config import Settings
-from clipforge.core.errors import not_found
-from clipforge.core.states import TERMINAL_STATES, JobStatus
-from clipforge.db.models import Job, JobEvent, Transcript, TranscriptSegment, User
-from clipforge.db.session import session_scope
-from clipforge.queue.base import QueueProvider
-from clipforge.services.clips import ClipService
-from clipforge.services.jobs import JobService
-from clipforge.storage import StorageProvider
+from ...errors import ClipForgeError, ErrorCode
+from ...jobs import queue as job_queue
+from ...jobs.manager import manager
+from ...services.events import BUS
+from ...system import hardware, process_snapshot
 
-router = APIRouter(prefix="/jobs", tags=["jobs"])
+router = APIRouter(tags=["jobs"])
 
 
-def _svc(db: Session, settings: Settings, queue: QueueProvider, storage: StorageProvider) -> JobService:
-    return JobService(db, settings, queue, storage)
+@router.get("/jobs")
+def list_jobs(
+    project_id: str = Query(""),
+    statuses: str = Query("", description="Comma separated"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    parsed = tuple(item for item in statuses.split(",") if item)
+    return {"jobs": job_queue.list_jobs(project_id=project_id, statuses=parsed, limit=limit)}
 
 
-@router.post("", response_model=JobOut, status_code=201)
-def create_job(body: JobCreateRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-               user: User = Depends(current_user), db: Session = Depends(get_db),
-               settings: Settings = Depends(get_settings_dep), queue: QueueProvider = Depends(get_queue_dep),
-               storage: StorageProvider = Depends(get_storage_dep)) -> Any:
-    svc = _svc(db, settings, queue, storage)
-    job, created = svc.create(user, body.upload_id, body.settings.model_dump(exclude_none=True), idempotency_key)
-    db.commit()
-    if created:
-        svc.notify_queue(job)  # after commit so the worker can see the row
-    return JSONResponse(job_out(job, db), status_code=201 if created else 200)
+@router.get("/jobs/queue")
+def get_queue(project_id: str = Query("")):
+    return {
+        "queue": job_queue.queue_state(project_id),
+        "workers": manager().status(),
+    }
 
 
-@router.get("", response_model=JobListOut)
-def list_jobs(status: str | None = Query(default=None, max_length=30), limit: int = Query(default=20, ge=1, le=100),
-              offset: int = Query(default=0, ge=0), user: User = Depends(current_user),
-              db: Session = Depends(get_db), settings: Settings = Depends(get_settings_dep)) -> dict[str, Any]:
-    rows, total = JobService(db, settings).list(user, status=status, limit=limit, offset=offset)
-    return {"items": [job_out(j, db) for j in rows], "total": total, "limit": limit, "offset": offset}
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = manager().cancel(job_id)
+    if job is None:
+        raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Job not found.", status_code=404)
+    return job
 
 
-@router.get("/{job_id}", response_model=JobOut)
-def get_job(job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-            settings: Settings = Depends(get_settings_dep)) -> dict[str, Any]:
-    return job_out(JobService(db, settings).get(user, job_id), db)
+@router.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str):
+    job = manager().retry(job_id)
+    if job is None:
+        raise ClipForgeError(code=ErrorCode.NOT_FOUND, message="Job not found.", status_code=404)
+    return job
 
 
-@router.post("/{job_id}/cancel", response_model=JobOut)
-def cancel_job(job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-               settings: Settings = Depends(get_settings_dep), queue: QueueProvider = Depends(get_queue_dep),
-               storage: StorageProvider = Depends(get_storage_dep)) -> dict[str, Any]:
-    svc = _svc(db, settings, queue, storage)
-    job = svc.cancel(user, svc.get(user, job_id))
-    db.commit()
-    return job_out(job, db)
+@router.post("/jobs/retry-failed")
+def retry_failed(project_id: str = Body("", embed=True)):
+    count = manager().retry_failed(project_id)
+    return {"retried": count}
 
 
-@router.post("/{job_id}/retry", response_model=JobOut)
-def retry_job(job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-              settings: Settings = Depends(get_settings_dep), queue: QueueProvider = Depends(get_queue_dep),
-              storage: StorageProvider = Depends(get_storage_dep)) -> dict[str, Any]:
-    svc = _svc(db, settings, queue, storage)
-    job = svc.retry(user, svc.get(user, job_id))
-    db.commit()
-    svc.notify_queue(job)
-    return job_out(job, db)
+@router.post("/jobs/purge")
+def purge(project_id: str = Body("", embed=True)):
+    removed = job_queue.purge_finished(project_id)
+    return {"removed": removed}
 
 
-@router.delete("/{job_id}", status_code=204)
-def delete_job(job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-               settings: Settings = Depends(get_settings_dep), queue: QueueProvider = Depends(get_queue_dep),
-               storage: StorageProvider = Depends(get_storage_dep)) -> None:
-    svc = _svc(db, settings, queue, storage)
-    svc.delete(user, svc.get(user, job_id))
-    db.commit()
+@router.get("/workers")
+def workers():
+    return manager().status()
 
 
-@router.get("/{job_id}/clips", response_model=list[ClipOut])
-def job_clips(job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-              settings: Settings = Depends(get_settings_dep),
-              storage: StorageProvider = Depends(get_storage_dep)) -> list[dict[str, Any]]:
-    job = JobService(db, settings).get(user, job_id)
-    return [clip_out(c, db, settings) for c in ClipService(db, settings, storage).list_for_job(user, job)]
+@router.post("/workers/start")
+def start_workers(workers: int = Body(0, embed=True)):
+    return manager().start(workers=workers or None)
 
 
-@router.get("/{job_id}/events", response_model=list[JobEventOut])
-def job_events(job_id: str, after: int = Query(default=0, ge=0), limit: int = Query(default=200, ge=1, le=1000),
-               user: User = Depends(current_user), db: Session = Depends(get_db),
-               settings: Settings = Depends(get_settings_dep)) -> list[dict[str, Any]]:
-    JobService(db, settings).get(user, job_id)
-    rows = db.scalars(select(JobEvent).where(JobEvent.job_id == job_id, JobEvent.id > after)
-                      .order_by(JobEvent.id).limit(limit)).all()
-    return [event_out(e) for e in rows]
+@router.post("/workers/stop")
+def stop_workers():
+    manager().stop()
+    return manager().status()
 
 
-@router.get("/{job_id}/transcript")
-def job_transcript(job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db),
-                   settings: Settings = Depends(get_settings_dep)) -> dict[str, Any]:
-    JobService(db, settings).get(user, job_id)
-    t = db.scalar(select(Transcript).where(Transcript.job_id == job_id))
-    if t is None:
-        raise not_found("Transcript")
-    segs = db.scalars(select(TranscriptSegment).where(TranscriptSegment.transcript_id == t.id)
-                      .order_by(TranscriptSegment.idx)).all()
-    return {"language": t.language, "provider": t.provider, "model": t.model, "duration_seconds": t.duration_seconds,
-            "word_count": t.word_count,
-            "segments": [{"id": s.idx, "start": s.start, "end": s.end, "text": s.text, "speaker_id": s.speaker_id,
-                          "topic_id": s.topic_id, "words": s.words} for s in segs]}
+@router.get("/events")
+async def events(
+    request: Request,
+    project_id: str = Query(""),
+    include_hardware: bool = Query(True),
+):
+    """Server-Sent Events stream of pipeline progress, queue changes and errors."""
+
+    async def generator():
+        loop = asyncio.get_running_loop()
+        stream = BUS.stream(project_id)
+
+        def next_event():
+            try:
+                return next(stream)
+            except StopIteration:
+                return None
+
+        if include_hardware:
+            payload = {"type": "hardware", "hardware": hardware(), "usage": process_snapshot()}
+            yield f"data: {json.dumps(payload, default=str)}\n\n"
+
+        last_usage = 0.0
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                event = await loop.run_in_executor(None, next_event)
+                if event is None:
+                    break
+                if event.get("type") == "heartbeat":
+                    if include_hardware:
+                        import time
+
+                        now = time.time()
+                        if now - last_usage > 10:
+                            last_usage = now
+                            event = {"type": "usage", "usage": process_snapshot(), "queue": job_queue.queue_state(project_id)["counts"]}
+                    yield ": ping\n\n"
+                    continue
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+        finally:
+            stream.close()
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
-# ------------------------------------------------------------------- SSE
-def _sse(event: str, data: dict[str, Any], event_id: int | None = None) -> str:
-    lines = []
-    if event_id is not None:
-        lines.append(f"id: {event_id}")
-    lines.append(f"event: {event}")
-    lines.append("data: " + json.dumps(data, separators=(",", ":")))
-    return "\n".join(lines) + "\n\n"
-
-
-@router.get("/{job_id}/stream")
-async def job_stream(job_id: str, request: Request, user: User = Depends(current_user),
-                     last_event_id: str | None = Header(default=None, alias="Last-Event-ID")) -> StreamingResponse:
-    """Server-Sent Events: ``job.progress`` snapshots plus raw ``job.event`` rows.
-
-    Reconnects resume from ``Last-Event-ID``. The stream closes once the job
-    reaches a terminal state.
-    """
-    factory = request.app.state.session_factory
-    settings: Settings = request.app.state.settings
-    user_id = user.id
-
-    def load(after: int) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        with session_scope(factory) as s:
-            job = s.scalar(select(Job).where(Job.id == job_id, Job.user_id == user_id, Job.deleted_at.is_(None)))
-            if job is None:
-                return None, []
-            events = s.scalars(select(JobEvent).where(JobEvent.job_id == job_id, JobEvent.id > after)
-                               .order_by(JobEvent.id).limit(500)).all()
-            return job_out(job), [event_out(e) for e in events]
-
-    first, _ = await run_in_threadpool(load, 0)
-    if first is None:
-        raise not_found("Job")
-    try:
-        cursor = int(last_event_id) if last_event_id else 0
-    except ValueError:
-        cursor = 0
-
-    async def gen() -> AsyncIterator[str]:
-        nonlocal cursor
-        yield f"retry: {settings.SSE_RETRY_MS}\n\n"
-        last_snapshot: tuple[Any, ...] | None = None
-        idle = 0.0
-        while True:
-            if await request.is_disconnected():
-                return
-            job, events = await run_in_threadpool(load, cursor)
-            if job is None:
-                yield _sse("job.deleted", {"job_id": job_id})
-                return
-            for e in events:
-                cursor = e["id"]
-                yield _sse("job.event", {"job_id": job_id, **e}, cursor)
-            snapshot = (job["status"], job["progress"], job["current_stage"])
-            if snapshot != last_snapshot:
-                last_snapshot = snapshot
-                idle = 0.0
-                yield _sse("job.progress", {"job_id": job_id, "status": job["status"], "progress": job["progress"],
-                                            "stage": job["current_stage"], "error": job["error"]})
-            if JobStatus(job["status"]) in TERMINAL_STATES and not events:
-                yield _sse("job.finished", {"job_id": job_id, "status": job["status"]})
-                return
-            await asyncio.sleep(settings.SSE_POLL_SECONDS)
-            idle += settings.SSE_POLL_SECONDS
-            if idle >= 15:
-                idle = 0.0
-                yield ": keep-alive\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+__all__ = ["router"]

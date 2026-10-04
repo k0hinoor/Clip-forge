@@ -1,165 +1,308 @@
-"""Smart reframing (TRD §18; PRD §10).
+"""Smart reframing: horizontal footage → vertical short, without decapitating anyone.
 
-1. determine source dimensions
-2. determine target crop
-3. detect faces/subjects (from sampled-frame visual analysis)
-4. generate crop trajectory
-5. smooth trajectory
-6. render via FFmpeg (piecewise-linear crop expressions)
+The framer converts visual analysis (:mod:`clipforge.ai.vision`) into a *crop
+plan*: a small number of horizontal centre keyframes plus a smooth ffmpeg
+expression that interpolates between them. Faces win over motion, motion wins
+over a plain centre crop, and when two people are too far apart to fit in a 9:16
+window the framer recommends the blurred-background layout instead of pretending
+a crop would work.
 
-The resulting plan is stored on the clip so renders are reproducible.
+Everything degrades gracefully: with no OpenCV and no frames, the plan is a
+static centre crop - the same thing every other clipper does - and the notes say
+so explicitly.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Sequence
 
-FRAMING_VERSION = "1"
-MAX_KEYFRAMES = 30
+import numpy as np
 
+from ..logging_setup import get_logger
+from ..ai.vision import FrameAnalysis, face_center_x, face_span, multi_speaker_layout
 
-def parse_aspect(aspect: str) -> tuple[int, int]:
-    a, b = aspect.split(":")
-    return int(a), int(b)
+log = get_logger("clipforge.render")
 
-
-def _even(x: float) -> int:
-    return max(2, int(x) // 2 * 2)
+MIN_CROP_CONFIDENCE = 0.25
 
 
-def cover_crop(src_w: int, src_h: int, aspect: str) -> tuple[int, int]:
-    """Largest crop of the target aspect ratio that fits inside the source."""
-    aw, ah = parse_aspect(aspect)
-    target = aw / ah
-    if src_w / src_h > target:
-        return _even(src_h * target), _even(src_h)
-    return _even(src_w), _even(src_w / target)
+@dataclass
+class CropKeyframe:
+    time: float      # seconds, relative to the clip
+    center_x: float  # 0..1 in source coordinates
+
+    def to_dict(self) -> dict[str, float]:
+        return {"time": round(self.time, 3), "x": round(self.center_x, 4)}
 
 
-def _primary_face(frame: dict[str, Any]) -> list[float] | None:
-    faces = frame.get("face_boxes") or []
-    if not faces:
-        return None
-    return max(faces, key=lambda b: b[2] * b[3])  # normalised [x, y, w, h]
+@dataclass
+class CropPlan:
+    source_width: int
+    source_height: int
+    target_width: int
+    target_height: int
+    crop_width: int
+    crop_height: int
+    mode: str = "static"          # static | tracked | fit_blur
+    keyframes: list[CropKeyframe] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    face_ratio: float = 0.0
+    shot_type: str = "unknown"
+
+    @property
+    def is_tracked(self) -> bool:
+        return self.mode == "tracked" and len(self.keyframes) > 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "source": [self.source_width, self.source_height],
+            "target": [self.target_width, self.target_height],
+            "crop": [self.crop_width, self.crop_height],
+            "keyframes": [keyframe.to_dict() for keyframe in self.keyframes[:40]],
+            "notes": self.notes,
+            "face_ratio": round(self.face_ratio, 3),
+            "shot_type": self.shot_type,
+        }
+
+    # ------------------------------------------------------------------ ffmpeg
+    def crop_x_expression(self) -> str:
+        """Piecewise-linear ``x`` expression for ffmpeg's crop filter (in source px)."""
+        max_x = max(0, self.source_width - self.crop_width)
+        if max_x == 0:
+            return "0"
+        if not self.keyframes:
+            return str(max_x // 2)
+
+        points = [
+            (keyframe.time, float(np.clip(keyframe.center_x * self.source_width - self.crop_width / 2.0, 0, max_x)))
+            for keyframe in self.keyframes
+        ]
+        if len(points) == 1:
+            return f"{points[0][1]:.2f}"
+
+        expression = f"{points[-1][1]:.2f}"
+        for index in range(len(points) - 1, 0, -1):
+            t0, x0 = points[index - 1]
+            t1, x1 = points[index]
+            span = max(t1 - t0, 1e-3)
+            # Hold the first value before the first keyframe and interpolate after.
+            expression = f"if(lt(t,{t1:.3f}),{x0:.2f}+({x1 - x0:.2f})*(t-{t0:.3f})/{span:.3f},{expression})"
+        return f"if(lt(t,{points[0][0]:.3f}),{points[0][1]:.2f},{expression})"
+
+    def crop_y_expression(self) -> str:
+        max_y = max(0, self.source_height - self.crop_height)
+        if max_y == 0:
+            return "0"
+        # Bias slightly above centre: faces usually sit in the upper third.
+        return str(int(max_y * 0.42))
 
 
-def smooth_positions(samples: Sequence[tuple[float, float]], *, crop_size: float, max_speed: float,
-                     dead_zone: float, alpha: float = 0.35) -> list[tuple[float, float]]:
-    """Dead-zone + exponential smoothing + speed clamp for a 1-D crop offset."""
-    out: list[tuple[float, float]] = []
-    pos: float | None = None
-    last_t = 0.0
-    for t, target in samples:
-        if pos is None:
-            pos = target
-        else:
-            if abs(target - pos) > dead_zone * crop_size:
-                desired = pos + alpha * (target - pos)
-                limit = max_speed * crop_size * max(t - last_t, 1e-3)
-                pos = pos + max(-limit, min(limit, desired - pos))
-        out.append((t, pos))
-        last_t = t
-    return out
+# --------------------------------------------------------------------------- #
+# Plan builders
+# --------------------------------------------------------------------------- #
 
 
-def _reduce(points: list[tuple[float, float, float]], tolerance: float) -> list[tuple[float, float, float]]:
-    if len(points) <= 2:
-        return points
-    kept = [points[0]]
-    for p in points[1:-1]:
-        if abs(p[1] - kept[-1][1]) > tolerance or abs(p[2] - kept[-1][2]) > tolerance:
-            kept.append(p)
-    kept.append(points[-1])
-    if len(kept) > MAX_KEYFRAMES:
-        step = (len(kept) - 1) / (MAX_KEYFRAMES - 1)
-        kept = [kept[round(i * step)] for i in range(MAX_KEYFRAMES)]
-    return kept
-
-
-def plan_framing(
+def plan_crop(
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    analyses: Sequence[FrameAnalysis],
     *,
-    src_w: int,
-    src_h: int,
-    out_w: int,
-    out_h: int,
-    aspect: str,
-    mode: str,
-    frames: Sequence[dict[str, Any]] | None,
     duration: float,
-) -> dict[str, Any]:
-    crop_w, crop_h = cover_crop(src_w, src_h, aspect)
-    needs_crop = crop_w < src_w - 2 or crop_h < src_h - 2
-    frames = list(frames or [])
-    with_face = [f for f in frames if f.get("face_boxes")]
-    face_ratio = len(with_face) / len(frames) if frames else 0.0
-    resolved = mode
-    if mode == "auto":
-        if not needs_crop or not frames:
-            resolved = "center"
-        elif face_ratio >= 0.3:
-            resolved = "face"
-        elif face_ratio > 0:
-            resolved = "center"
-        else:
-            # Screen recordings / gameplay: avoid destructive cropping.
-            resolved = "fit"
-    if mode == "face" and not with_face:
-        resolved = "center"
+    smart: bool = True,
+    tracking: bool = True,
+) -> CropPlan:
+    """Decide how to cut the source frame for the target aspect ratio."""
+    target_ratio = target_width / max(target_height, 1)
+    source_ratio = source_width / max(source_height, 1)
 
-    plan: dict[str, Any] = {
-        "version": FRAMING_VERSION, "mode": resolved, "requested_mode": mode, "aspect_ratio": aspect,
-        "src_w": src_w, "src_h": src_h, "crop_w": crop_w, "crop_h": crop_h, "out_w": out_w, "out_h": out_h,
-        "face_ratio": round(face_ratio, 3), "keyframes": [],
-    }
-    cx, cy = (src_w - crop_w) / 2, (src_h - crop_h) / 2
-    if resolved == "fit":
-        return plan
-    if resolved == "center" or not needs_crop:
-        plan["keyframes"] = [{"t": 0.0, "x": round(cx), "y": round(cy)}]
+    if source_ratio <= target_ratio + 0.02:
+        # Source is already as tall (or taller) than the target: no horizontal crop.
+        plan = CropPlan(
+            source_width=source_width,
+            source_height=source_height,
+            target_width=target_width,
+            target_height=target_height,
+            crop_width=source_width,
+            crop_height=source_height,
+            mode="static",
+            notes=["Source is already vertical or square - the frame is scaled, not cropped."],
+        )
         return plan
 
-    # Face tracking: target offsets per sampled frame; hold last known when no face.
-    samples_x: list[tuple[float, float]] = []
-    samples_y: list[tuple[float, float]] = []
-    last_x, last_y = cx, cy
-    for f in sorted(frames, key=lambda fr: fr["t"]):
-        face = _primary_face(f)
-        if face is not None:
-            fx = (face[0] + face[2] / 2) * src_w
-            fy = (face[1] + face[3] * 0.4) * src_h  # keep eyes in upper part (headroom)
-            last_x = min(max(fx - crop_w / 2, 0), src_w - crop_w)
-            last_y = min(max(fy - crop_h * 0.4, 0), src_h - crop_h)
-        samples_x.append((float(f["t"]), last_x))
-        samples_y.append((float(f["t"]), last_y))
-    sx = smooth_positions(samples_x, crop_size=crop_w, max_speed=0.6, dead_zone=0.08)
-    sy = smooth_positions(samples_y, crop_size=crop_h, max_speed=0.6, dead_zone=0.08)
-    points = [(t, x, y) for (t, x), (_, y) in zip(sx, sy, strict=True)]
-    if points and points[0][0] > 0:
-        points.insert(0, (0.0, points[0][1], points[0][2]))
-    if points and points[-1][0] < duration:
-        points.append((round(duration, 3), points[-1][1], points[-1][2]))
-    points = _reduce(points, tolerance=max(2.0, 0.01 * crop_w))
-    plan["keyframes"] = [{"t": round(t, 3),
-                          "x": int(min(max(round(x), 0), src_w - crop_w)),
-                          "y": int(min(max(round(y), 0), src_h - crop_h))} for t, x, y in points]
+    crop_height = source_height
+    crop_width = int(round(crop_height * target_ratio))
+    crop_width = min(crop_width, source_width, target_width * 4)
+
+    plan = CropPlan(
+        source_width=source_width,
+        source_height=source_height,
+        target_width=target_width,
+        target_height=target_height,
+        crop_width=crop_width,
+        crop_height=crop_height,
+    )
+
+    if not analyses:
+        plan.mode = "static"
+        plan.notes.append("No frame analysis available - using a centre crop.")
+        return plan
+
+    usable = [analysis for analysis in analyses if analysis.width and not analysis.error]
+    if not usable:
+        plan.mode = "static"
+        plan.notes.append("Frame analysis produced no usable frames - using a centre crop.")
+        return plan
+
+    plan.face_ratio = sum(1 for analysis in usable if analysis.faces) / len(usable)
+    plan.shot_type = multi_speaker_layout(usable[len(usable) // 2])
+
+    # Two speakers too far apart for a 9:16 crop → suggest the blur layout.
+    spans = [face_span(analysis) for analysis in usable]
+    spans = [span for span in spans if span is not None]
+    if spans:
+        widest = max(span[1] - span[0] for span in spans)
+        if widest * source_width > crop_width * 1.06:
+            plan.mode = "fit_blur"
+            plan.notes.append(
+                "Two speakers are further apart than a 9:16 crop can hold - "
+                "the blurred-background layout keeps both of them visible."
+            )
+            return plan
+
+    if not smart:
+        plan.mode = "static"
+        plan.notes.append("Smart reframing is disabled in settings - using a centre crop.")
+        return plan
+
+    centers = [_center_for(analysis, tracking) for analysis in usable]
+    times = [analysis.time for analysis in usable]
+    centers = _smooth(centers, window=3)
+
+    # Static when the subject barely moves; tracked when it does.
+    spread = float(np.max(centers) - np.min(centers)) if centers else 0.0
+    if spread < 0.045 or len(centers) < 3:
+        plan.mode = "static"
+        plan.keyframes = [CropKeyframe(time=0.0, center_x=float(np.median(centers)) if centers else 0.5)]
+        if plan.face_ratio > 0.3:
+            plan.notes.append(f"Steady framing on the speaker ({int(plan.face_ratio * 100)}% of sampled frames contain faces).")
+        return plan
+
+    # Keyframes at most one per 1.5s: smooth movement instead of jitter.
+    step = max(1, int(round(len(centers) / max(duration / 1.5, 1))))
+    keyframes = [
+        CropKeyframe(time=times[index] - times[0], center_x=float(np.clip(centers[index], 0.0, 1.0)))
+        for index in range(0, len(centers), step)
+    ]
+    if keyframes and keyframes[-1].time < duration:
+        keyframes.append(
+            CropKeyframe(time=duration, center_x=float(np.clip(centers[-1], 0.0, 1.0)))
+        )
+    plan.mode = "tracked" if tracking else "static"
+    plan.keyframes = keyframes if tracking else [CropKeyframe(time=0.0, center_x=0.5)]
+    plan.notes.append(
+        f"Speaker tracking enabled: {len(plan.keyframes)} smooth framing keyframes across {duration:.0f}s."
+        if tracking
+        else "Speaker tracking is off in settings - static framing."
+    )
     return plan
 
 
-def piecewise_expr(keyframes: Sequence[dict[str, Any]], axis: str) -> str:
-    """Build a numeric-only FFmpeg expression interpolating ``axis`` over ``t``."""
-    pts = [(float(k["t"]), float(k[axis])) for k in keyframes]
-    if not pts:
-        return "0"
-    for t, v in pts:
-        if not (0 <= t < 1e6 and -1 < v < 1e5):
-            raise ValueError("Invalid keyframe values")
-    expr = f"{pts[-1][1]:.1f}"
-    for (t0, v0), (t1, v1) in reversed(list(zip(pts[:-1], pts[1:], strict=True))):
-        if t1 <= t0:
-            continue
-        seg = f"{v0:.1f}+({v1 - v0:.1f})*(t-{t0:.3f})/{t1 - t0:.3f}"
-        expr = f"if(lt(t\\,{t1:.3f})\\,{seg}\\,{expr})"
-    if len(pts) == 1:
-        return f"{pts[0][1]:.1f}"
-    return expr
+def _center_for(analysis: FrameAnalysis, tracking: bool) -> float:
+    if not tracking:
+        return 0.5
+    center = face_center_x(analysis)
+    if center is not None:
+        # Bias toward keeping the body in frame, not just the face.
+        return float(np.clip(center, 0.15, 0.85))
+    return float(np.clip(analysis.subject_x, 0.2, 0.8))
+
+
+def _smooth(values: Sequence[float], *, window: int = 3) -> list[float]:
+    """Median filter + exponential smoothing: removes detector flicker."""
+    if not values:
+        return []
+    array = np.asarray(values, dtype=np.float64)
+    if array.size >= window:
+        padded = np.pad(array, (window // 2, window // 2), mode="edge")
+        filtered = np.array([np.median(padded[index: index + window]) for index in range(array.size)])
+    else:
+        filtered = array
+
+    smoothed: list[float] = []
+    previous = float(filtered[0])
+    alpha = 0.45
+    for value in filtered:
+        previous = alpha * float(value) + (1 - alpha) * previous
+        smoothed.append(previous)
+    return smoothed
+
+
+def crop_plan_from_dict(payload: dict[str, Any] | None) -> CropPlan | None:
+    """Rebuild a stored crop plan (used when re-rendering an existing clip)."""
+    if not payload:
+        return None
+    try:
+        plan = CropPlan(
+            source_width=int(payload.get("source", [0, 0])[0]),
+            source_height=int(payload.get("source", [0, 0])[1]),
+            target_width=int(payload.get("target", [0, 0])[0]),
+            target_height=int(payload.get("target", [0, 0])[1]),
+            crop_width=int(payload.get("crop", [0, 0])[0]),
+            crop_height=int(payload.get("crop", [0, 0])[1]),
+            mode=str(payload.get("mode", "static")),
+            face_ratio=float(payload.get("face_ratio", 0.0)),
+            shot_type=str(payload.get("shot_type", "unknown")),
+            notes=list(payload.get("notes") or []),
+        )
+    except (TypeError, ValueError, IndexError):
+        return None
+    plan.keyframes = [
+        CropKeyframe(time=float(item.get("time", 0.0)), center_x=float(item.get("x", 0.5)))
+        for item in payload.get("keyframes") or []
+    ]
+    if plan.crop_width <= 0 or plan.crop_height <= 0:
+        return None
+    return plan
+
+
+def plan_for_layout(
+    layout: str,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    analyses: Sequence[FrameAnalysis],
+    *,
+    duration: float,
+    smart: bool = True,
+    tracking: bool = True,
+) -> CropPlan:
+    """Layout-aware wrapper: some layouts do not need a crop at all."""
+    if layout in {"blur", "cinematic"}:
+        plan = plan_crop(
+            source_width, source_height, target_width, target_height, analyses,
+            duration=duration, smart=smart, tracking=tracking,
+        )
+        if layout == "blur":
+            plan.mode = "fit_blur"
+            plan.notes = ["Blurred background layout: the full source frame stays visible."]
+        return plan
+
+    plan = plan_crop(
+        source_width, source_height, target_width, target_height, analyses,
+        duration=duration, smart=smart, tracking=tracking,
+    )
+    if plan.mode == "fit_blur" and layout in {"split", "podcast"}:
+        # Split layouts pan-and-scan the podcast panel using the subject position.
+        plan.mode = "tracked" if plan.keyframes else "static"
+        if not plan.keyframes:
+            plan.keyframes = [CropKeyframe(time=0.0, center_x=0.5)]
+        plan.notes.append("Wide two-shot: each speaker is followed with a gentle pan inside the podcast panel.")
+    return plan
+
+
+__all__ = ["CropKeyframe", "CropPlan", "plan_crop", "plan_for_layout"]
