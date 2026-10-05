@@ -173,7 +173,7 @@ def test_pipeline_skips_unparsable_transcript_files(tmp_path: Path, settings):
     class Paths:
         transcript = tmp_path
 
-    transcript = _transcript_from_files(Paths(), settings, NullReporter(), detect_language("hello there"))
+    transcript = _transcript_from_files(Paths(), settings, NullReporter(), detect_language("hello there"), allow_legacy=True)
 
     assert transcript is not None, "the good transcript must still be used"
     assert transcript.model == "talk.srt"

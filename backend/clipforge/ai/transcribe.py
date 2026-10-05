@@ -194,14 +194,14 @@ _MODELS: dict[tuple[str, str, str], Any] = {}
 _MODEL_LOCK = threading.Lock()
 
 
-def _device_and_compute(settings: AppSettings) -> tuple[str, str]:
+def _device_and_compute(settings: AppSettings, force_cpu: bool = False) -> tuple[str, str]:
     report = hardware()
     has_cuda = bool(report.get("gpu", {}).get("cuda"))
     device = settings.whisper_device
     if device == "auto":
-        device = "cuda" if has_cuda else "cpu"
-    if device == "cuda" and not has_cuda:
-        log.warning("CUDA requested but no NVIDIA GPU detected; using CPU")
+        device = "cuda" if has_cuda and not force_cpu else "cpu"
+    if device == "cuda" and (not has_cuda or force_cpu):
+        log.warning("CUDA requested but no NVIDIA GPU detected or CUDA disabled; using CPU")
         device = "cpu"
 
     compute = settings.whisper_compute_type
@@ -215,11 +215,12 @@ def _device_and_compute(settings: AppSettings) -> tuple[str, str]:
     return device, compute
 
 
-def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str, str]:
+def _load_faster_whisper(settings: AppSettings, force_cpu: bool = False) -> tuple[Any, str, str, str]:
     """Load (or reuse) a faster-whisper model: ``(model, device, compute, model_name)``.
 
     The model is downgraded when the configured one cannot fit in memory (see
     :func:`clipforge.system.fit_whisper_model`); the reason is logged.
+    When force_cpu=True, bypass CUDA even if detected (used after CUDA runtime failures).
     """
     try:
         from faster_whisper import WhisperModel  # type: ignore
@@ -231,7 +232,7 @@ def _load_faster_whisper(settings: AppSettings) -> tuple[Any, str, str, str]:
             status_code=503,
         ) from exc
 
-    device, compute = _device_and_compute(settings)
+    device, compute = _device_and_compute(settings, force_cpu=force_cpu)
     model_name = settings.whisper_model
     if device == "cpu":
         model_name, note = fit_whisper_model(settings.whisper_model)
@@ -315,7 +316,16 @@ def transcribe_faster_whisper(
     language: str | None = None,
 ) -> Transcript:
     settings = settings or get_settings()
-    model, device, compute, model_name = _load_faster_whisper(settings)
+    
+    # Try with the original settings first
+    cpu_fallback = False
+    try:
+        model, device, compute, model_name = _load_faster_whisper(settings)
+    except ClipForgeError:
+        # If model loading failed, try CPU fallback immediately
+        cpu_fallback = True
+        model, device, compute, model_name = _load_faster_whisper(settings, force_cpu=True)
+    
     audio = str(audio_path)
 
     kwargs: dict[str, Any] = {
@@ -346,6 +356,21 @@ def transcribe_faster_whisper(
         # Older faster-whisper without batch_size support.
         kwargs.pop("batch_size", None)
         segment_iter, info = model.transcribe(audio, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        # Check for CUDA/cuBLAS runtime errors during transcription
+        message = str(exc).lower()
+        if not cpu_fallback and ("cuda" in message or "cublas" in message or "cudnn" in message):
+            log.warning("CUDA runtime error during transcription (%s); retrying on CPU", exc)
+            # Reload model on CPU and retry
+            model, device, compute, model_name = _load_faster_whisper(settings, force_cpu=True)
+            cpu_fallback = True
+            # Update kwargs for CPU - some parameters may need adjustment
+            if compute == "int8":
+                kwargs["compute_type"] = "int8"
+            segment_iter, info = model.transcribe(audio, **kwargs)
+        else:
+            # Re-raise if it's not a CUDA error or we already tried CPU
+            raise
 
     duration = float(getattr(info, "duration", 0.0) or 0.0)
     if not duration:

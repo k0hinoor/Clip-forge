@@ -12,6 +12,10 @@ opencv-python-headless>=4.9
 # install ffmpeg yourself. CLIPFORGE auto-discovers them if present.
 imageio-ffmpeg>=0.5
 
+# PyAV for audio/video processing - version 18.x is compatible, 19.x has breaking changes
+# with metadata_errors parameter. Keep constrained to avoid runtime errors.
+av>=18.1.0,<19.0.0
+
 # Optional: WhisperX adds wav2vec2 forced alignment (better word timings) and
 # pyannote based speaker diarization. It is heavy (pulls torch), install only if
 # you want maximum timestamp accuracy.
