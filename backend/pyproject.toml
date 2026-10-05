@@ -31,6 +31,8 @@ align = ["whisperx>=3.1"]
 vision = ["opencv-python-headless>=4.9"]
 # Bundled static ffmpeg binary for people who do not want to install ffmpeg.
 bundled-ffmpeg = ["imageio-ffmpeg>=0.5"]
+# PyAV for audio/video processing - version 18.x is compatible, 19.x has breaking changes
+av = ["av>=18.1.0,<19.0.0"]
 dev = ["pytest>=8", "pytest-timeout>=2.3"]
 
 [project.scripts]
