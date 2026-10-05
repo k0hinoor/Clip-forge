@@ -107,13 +107,17 @@ def build_clip_plan(
     # ------------------------------------------------------------ captions
     captions = None
     if settings.captions_enabled:
+        cue_captions = _remap_cues(sentences, timeline) if sentences and not words else []
         captions = plan_captions(
             caption_words,
             theme=settings.caption,
             language=language.describe() if language else settings.language_hint or "en",
             emphasis_words=_emphasis_words(features),
             zoom_times=[point["time"] for point in zoom_points],
+            cues=cue_captions if cue_captions else None,
         )
+        if cue_captions:
+            notes.append("Transcript cue timing retained; word-by-word animation is disabled because no word timings were provided.")
         notes.extend(captions.notes)
 
     # ------------------------------------------------------------- framing
@@ -265,6 +269,36 @@ def _remap_words(words: Sequence[Word], timeline: Timeline) -> list[Word]:
             word.end -= base
         return copies
     return timeline.map_words(copies)
+
+
+def _remap_cues(cues: Sequence[Any], timeline: Timeline) -> list[dict[str, Any]]:
+    """Map real cue boundaries to output time without deriving per-word times."""
+    mapped: list[dict[str, Any]] = []
+    for cue in cues:
+        if isinstance(cue, dict):
+            text = str(cue.get("text") or "").strip()
+            source_start = float(cue.get("start", 0.0))
+            source_end = float(cue.get("end", 0.0))
+        else:
+            text = str(getattr(cue, "text", "") or "").strip()
+            source_start = float(getattr(cue, "start", 0.0))
+            source_end = float(getattr(cue, "end", 0.0))
+        if not text or source_end <= source_start:
+            continue
+        start = timeline.source_to_output(source_start)
+        end = timeline.source_to_output(source_end)
+        if start is None and source_start < timeline.source_start < source_end:
+            start = timeline.source_to_output(timeline.source_start)
+        if end is None and source_start < timeline.source_end < source_end:
+            end = timeline.source_to_output(timeline.source_end)
+        if start is None:
+            continue
+        if end is None or end <= start:
+            end = min(timeline.output_duration, start + 0.08)
+        if end <= start:
+            continue
+        mapped.append({"text": text, "start": float(start), "end": float(end)})
+    return mapped
 
 
 def _emphasis_words(features: CandidateFeatures) -> list[str]:
@@ -440,11 +474,20 @@ def rebuild_captions(clip: Any, settings: AppSettings, language: str, zoom_times
     words = load_clip_words(clip)
     timeline = load_timeline(clip, settings)
     caption_words = _remap_words(words, timeline)
+    cues: list[dict[str, Any]] = []
+    if not words:
+        try:
+            segments = json.loads(clip.segments_json or "{}")
+        except json.JSONDecodeError:
+            segments = {}
+        cue_rows = segments.get("sentences", []) if isinstance(segments, dict) else []
+        cues = _remap_cues(cue_rows, timeline)
     return plan_captions(
         caption_words,
         theme=settings.caption,
         language=language,
         zoom_times=zoom_times,
+        cues=cues if cues else None,
     )
 
 

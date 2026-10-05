@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -178,58 +180,114 @@ def get_transcript(
 
 @router.post("/{project_id}/transcript")
 async def upload_transcript(project_id: str, file: UploadFile = File(...)):
-    """Attach a transcript/caption file (``.json3``, ``.srt``, ``.vtt``, ``.txt``).
-
-    When a project has one of these, the analysis pipeline uses it instead of
-    speech recognition - useful when the user already owns accurate captions.
-    """
-    from ...media.download import TRANSCRIPT_EXTENSIONS
+    """Attach an authoritative transcript cue file for this project."""
+    from ...media.download import TRANSCRIPT_EXTENSIONS, parse_transcript_segments
     from ...pipeline.context import ProjectPaths
 
     detail = project_service.project_detail(project_id)
-    suffix = Path(file.filename or "transcript.srt").suffix.lower()
+    active = job_queue.active_jobs(project_id=project_id, kinds=("analyze",))
+    if active:
+        await file.close()
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message="A transcript cannot be replaced while analysis is running.",
+            hint="Cancel or wait for the current analysis, then attach the new transcript.",
+            status_code=409,
+        )
+
+    raw_filename = (file.filename or "transcript.srt").replace("\\", "/")
+    filename = Path(raw_filename).name or "transcript.srt"
+    suffix = Path(filename).suffix.lower()
     if suffix not in TRANSCRIPT_EXTENSIONS:
+        await file.close()
         raise ClipForgeError(
             code=ErrorCode.INVALID_INPUT,
             message=f"'{suffix or 'that file'}' is not a supported transcript format.",
-            hint="Supported formats: .json3 (YouTube), .srt, .vtt, .txt with [hh:mm:ss] stamps.",
+            hint="Supported formats: .srt, .vtt, .json3, and timestamped .txt.",
             status_code=422,
         )
 
     paths = ProjectPaths.for_snapshot(detail).ensure()
-    target = paths.transcript / f"provided{suffix}"
     size = 0
-    with target.open("wb") as handle:
-        while chunk := await file.read(1024 * 512):
-            size += len(chunk)
-            if size > 40 * 1024 * 1024:
-                handle.close()
-                target.unlink(missing_ok=True)
-                raise ClipForgeError(
-                    code=ErrorCode.UPLOAD_TOO_LARGE,
-                    message="That transcript is larger than 40 MB.",
-                    status_code=413,
-                )
-            handle.write(chunk)
-    await file.close()
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix=".incoming_", dir=paths.transcript) as handle:
+            temp_path = Path(handle.name)
+            while chunk := await file.read(1024 * 512):
+                size += len(chunk)
+                if size > 40 * 1024 * 1024:
+                    raise ClipForgeError(
+                        code=ErrorCode.UPLOAD_TOO_LARGE,
+                        message="That transcript is larger than 40 MB.",
+                        status_code=413,
+                    )
+                handle.write(chunk)
+    except BaseException:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
 
-    from ...media.download import parse_transcript_file
+    try:
+        cues = parse_transcript_segments(temp_path)
+        if not cues:
+            raise ClipForgeError(
+                code=ErrorCode.INVALID_INPUT,
+                message="That file contained no valid timestamped cues.",
+                hint="Check its SRT/VTT timestamps or the timestamped-text format, then attach it again.",
+                status_code=422,
+            )
 
-    words = parse_transcript_file(target)
-    if not words:
-        target.unlink(missing_ok=True)
-        raise ClipForgeError(
-            code=ErrorCode.INVALID_INPUT,
-            message="That file contained no readable timings.",
-            hint="Export an SRT/VTT from your editor, or use a YouTube .json3 caption file.",
-            status_code=422,
-        )
+        upload_dir = paths.transcript / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        safe_stem = re.sub(r"[^\w.-]+", "_", Path(filename).stem, flags=re.UNICODE).strip("._")[:100] or "transcript"
+        archived = upload_dir / f"{safe_stem}{suffix}"
+        shutil.copy2(temp_path, archived)
+        canonical = paths.transcript / f"provided{suffix}"
+        for old in paths.transcript.glob("provided.*"):
+            if old.is_file():
+                old.unlink(missing_ok=True)
+        shutil.copy2(temp_path, canonical)
+        result = project_service.attach_transcript(project_id, filename=filename, suffix=suffix, cues=cues)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    cue_count = len(cues)
+    word_count = sum(len(str(cue["text"]).split()) for cue in cues)
+    covers = max(float(cue["end"]) for cue in cues)
     return {
         "project_id": project_id,
-        "file": target.name,
-        "words": len(words),
-        "covers": round(words[-1]["end"], 2),
-        "message": f"Transcript attached ({len(words)} words). It will be used instead of speech recognition on the next analysis.",
+        "file": filename,
+        "source": result["transcript_source"],
+        "transcript_filename": result["transcript_filename"],
+        "timing_granularity": "cue",
+        "segment_count": cue_count,
+        "word_count": word_count,
+        "covers": round(covers, 3),
+        "message": f"Transcript attached: {filename} ({cue_count} cues). It will be used as-is; Whisper will not run unless you explicitly choose Use Whisper instead.",
+    }
+
+
+@router.post("/{project_id}/transcript/use-whisper")
+def use_whisper_for_transcript(project_id: str):
+    """Explicitly switch the next analysis to Whisper instead of the uploaded transcript."""
+    project_service.project_detail(project_id)
+    if job_queue.active_jobs(project_id=project_id, kinds=("analyze",)):
+        raise ClipForgeError(
+            code=ErrorCode.INVALID_INPUT,
+            message="Analysis is already running.",
+            hint="Wait for it to finish before switching transcript sources.",
+            status_code=409,
+        )
+    project_service.update_project(project_id, transcript_preference="whisper")
+    job = manager().enqueue_analysis(project_id, force=True)
+    return {
+        "project_id": project_id,
+        "transcript_preference": "whisper",
+        "job": job,
+        "message": "Whisper was explicitly selected. The uploaded file remains preserved; the displayed transcript source will change only after Whisper succeeds.",
     }
 
 

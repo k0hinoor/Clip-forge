@@ -222,8 +222,18 @@ class ProjectPaths:
 # --------------------------------------------------------------------------- #
 
 
-def save_transcript(project_id: str, utterances: Sequence[Utterance], *, language: str, engine: str, model: str) -> int:
-    """Persist every utterance and every word of the transcript."""
+def save_transcript(
+    project_id: str,
+    utterances: Sequence[Utterance],
+    *,
+    language: str,
+    engine: str,
+    model: str,
+    source: str = "whisper",
+    filename: str = "",
+    timing_granularity: str = "word",
+) -> int:
+    """Persist source-faithful transcript cues and only genuinely timed words."""
     with session_scope() as session:
         session.query(TranscriptSegment).filter(TranscriptSegment.project_id == project_id).delete()
         for index, utterance in enumerate(utterances):
@@ -243,12 +253,24 @@ def save_transcript(project_id: str, utterances: Sequence[Utterance], *, languag
         project = session.get(Project, project_id)
         if project is not None:
             project.segment_count = len(utterances)
-            project.word_count = sum(len(utterance.words) for utterance in utterances)
+            project.word_count = sum(len(utterance.words) or len(utterance.text.split()) for utterance in utterances)
+            project.transcript_source = source
+            project.transcript_preference = source
+            project.transcript_filename = filename
+            project.transcript_timing = timing_granularity
             try:
                 stats = json.loads(project.stats_json or "{}")
             except (TypeError, ValueError):
                 stats = {}
-            stats["transcript"] = {"engine": engine, "model": model, "language": language}
+            stats["transcript"] = {
+                "engine": engine,
+                "model": model,
+                "language": language,
+                "source": source,
+                "filename": filename,
+                "timing_granularity": timing_granularity,
+                "word_timing_count": sum(len(utterance.words) for utterance in utterances),
+            }
             stats["speakers"] = sorted({utterance.speaker for utterance in utterances if utterance.speaker})
             project.stats_json = json.dumps(stats)
     return len(utterances)
@@ -265,6 +287,8 @@ def load_sentences(project_id: str) -> list[Sentence]:
             .order_by(TranscriptSegment.idx)
             .all()
         )
+        project = session.get(Project, project_id)
+        preserve_cues = bool(project and project.transcript_timing == "cue")
         utterances: list[Utterance] = []
         for row in rows:
             words = [
@@ -288,15 +312,28 @@ def load_sentences(project_id: str) -> list[Sentence]:
                     words=words,
                 )
             )
-    return build_sentences(utterances)
+    return build_sentences(utterances, preserve_cue_boundaries=preserve_cues)
 
 
-def write_transcript_files(paths: ProjectPaths, sentences: Sequence[Sentence], *, language: str, engine: str, model: str) -> None:
+def write_transcript_files(
+    paths: ProjectPaths,
+    sentences: Sequence[Sentence],
+    *,
+    language: str,
+    engine: str,
+    model: str,
+    source: str = "whisper",
+    filename: str = "",
+    timing_granularity: str = "word",
+) -> None:
     payload = {
         "clipforge_version": __version__,
         "language": language,
         "engine": engine,
         "model": model,
+        "source": source,
+        "filename": filename,
+        "timing_granularity": timing_granularity,
         "sentences": [sentence.to_dict(with_words=True) for sentence in sentences],
     }
     (paths.transcript / "transcript.json").write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")

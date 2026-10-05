@@ -39,6 +39,10 @@ export interface ProjectSummary {
   candidate_count: number;
   word_count: number;
   segment_count: number;
+  transcript_source: string;
+  transcript_preference: string;
+  transcript_filename: string;
+  transcript_timing: "word" | "cue" | "";
   speakers: number;
   created_at: string;
   updated_at: string;
@@ -106,9 +110,36 @@ export interface StageState {
 }
 
 export interface ProjectStatus {
-  project: ProjectSummary & { word_count?: number; speakers?: number; clip_count?: number };
+  project: ProjectSummary & {
+    word_count?: number;
+    segment_count?: number;
+    speakers?: number;
+    clip_count?: number;
+    transcript_source?: string;
+    transcript_preference?: string;
+    transcript_filename?: string;
+    transcript_timing?: string;
+  };
   job: Job | null;
   stages: StageState[];
+  candidates: {
+    discovered: number;
+    stored: number;
+    scored: number;
+    scoring_errors: number;
+    threshold_pass: number;
+    context_rejections: number;
+    overlap_rejections: number;
+    final_accepted: number;
+    average_score: number;
+    highest_score: number;
+    threshold: number;
+    queued: number;
+    rendered: number;
+    top_rejection_reason: string;
+    statuses: Record<string, number>;
+  };
+  diagnostics: Record<string, any>;
   clips: { total: number; rendered: number; failed: number; pending: number; queued: number; rendering: number };
 }
 
@@ -173,6 +204,7 @@ export interface TranscriptSegment {
   speaker: string;
   confidence: number;
   word_count: number;
+  has_word_timings?: boolean;
   words?: TranscriptWord[];
 }
 
@@ -184,6 +216,10 @@ export interface Transcript {
   language_secondary: string;
   engine: string;
   model: string;
+  source: string;
+  preference: string;
+  filename: string;
+  timing_granularity: "word" | "cue" | "";
   word_count: number;
   segment_count: number;
   speakers: number;
@@ -204,6 +240,7 @@ export interface Candidate {
   score: number;
   confidence: number;
   reason: string;
+  rejection_code: string;
   status: string;
   factors: Record<string, number>;
   penalties: Record<string, number>;
@@ -254,7 +291,8 @@ export interface ClipAssetOptions {
 }
 
 export interface CaptionPlan {
-  lines: { index: number; text: string; start: number; end: number; words: { text: string; start: number; end: number }[] }[];
+  lines: { index: number; text: string; start: number; end: number; has_word_timings?: boolean; words: { text: string; start: number; end: number }[] }[];
+  timing_granularity?: "word" | "cue";
   /** The full style behind the preset, so the editor can show what is active. */
   theme?: { preset?: string; [key: string]: unknown };
   preset?: string;

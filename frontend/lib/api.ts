@@ -184,8 +184,22 @@ export const api = {
   uploadTranscript: (projectId: string, file: File) => {
     const form = new FormData();
     form.append("file", file);
-    return upload<{ file: string; words: number; message: string }>(`/api/projects/${projectId}/transcript`, form);
+    return upload<{
+      file: string;
+      source: string;
+      transcript_filename: string;
+      timing_granularity: "cue";
+      segment_count: number;
+      word_count: number;
+      covers: number;
+      message: string;
+    }>(`/api/projects/${projectId}/transcript`, form);
   },
+  useWhisper: (projectId: string) =>
+    request<{ project_id: string; transcript_preference: string; job: Job; message: string }>(
+      `/api/projects/${projectId}/transcript/use-whisper`,
+      { method: "POST" },
+    ),
   analyze: (projectId: string, options?: Record<string, unknown>, force = false) =>
     request<{ project_id: string; job: Job }>(`/api/projects/${projectId}/analyze`, json({ options, force })),
   cancelProject: (id: string) => request<{ cancelled_jobs: number }>(`/api/projects/${id}/cancel`, { method: "POST" }),

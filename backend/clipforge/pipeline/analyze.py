@@ -12,6 +12,7 @@ with an actionable message.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -40,7 +41,8 @@ from ..media.download import (
     download_captions,
     download_video,
     fetch_metadata,
-    parse_transcript_file,
+    parse_transcript_segments,
+    transcript_files,
 )
 from ..media.ffmpeg import extract_audio, probe_media
 from ..system import ai_stack, ensure_disk_space, ffmpeg_info, hardware
@@ -108,6 +110,25 @@ def _update_project(project_id: str, **fields: Any) -> None:
             setattr(project, key, value)
 
 
+def _update_analysis_snapshot(project_id: str, **fields: Any) -> None:
+    """Persist live discovery/scoring diagnostics without replacing other stats."""
+    with session_scope() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            return
+        try:
+            stats = json.loads(project.stats_json or "{}")
+        except (TypeError, ValueError):
+            stats = {}
+        analysis = stats.setdefault("analysis", {})
+        diagnostics = analysis.setdefault("diagnostics", {})
+        incoming = fields.pop("diagnostics", {})
+        if isinstance(incoming, dict):
+            diagnostics.update(incoming)
+        analysis.update(fields)
+        project.stats_json = json.dumps(stats, default=str)
+
+
 def _check_cancel(report: ProgressReporter) -> None:
     if report.cancelled():
         raise ClipForgeError(code=ErrorCode.CANCELLED, message="Analysis cancelled.", status_code=409)
@@ -136,13 +157,34 @@ def analyze(
         source_url = project.source_url
         source_type = project.source_type
         title = project.title
+        transcript_source = project.transcript_source
+        transcript_preference = project.transcript_preference
+        transcript_filename = project.transcript_filename
 
+    selected_transcript_source = transcript_preference or transcript_source
+    selected_transcript_filename = transcript_filename if selected_transcript_source.startswith("uploaded_") else ""
     settings = project_settings_from_snapshot(snapshot)
     paths = ProjectPaths.for_snapshot(snapshot).ensure()
     if not force:
         ensure_disk_space(2.0)
 
     stats: dict[str, Any] = {"started_at": time.time(), "stages": {}}
+    _update_analysis_snapshot(
+        project_id,
+        diagnostics={
+            "discovered": 0,
+            "scored": 0,
+            "scoring_errors": 0,
+            "threshold_pass": 0,
+            "context_rejections": 0,
+            "overlap_rejections": 0,
+            "final_accepted": 0,
+            "queued": 0,
+            "rendered": 0,
+            "threshold": 0.0 if settings.debug_mode else settings.min_score,
+            "debug_mode": settings.debug_mode,
+        },
+    )
 
     def mark(stage: str, seconds: float, **extra: Any) -> None:
         stats["stages"][stage] = {"seconds": round(seconds, 2), **extra}
@@ -153,20 +195,40 @@ def analyze(
     media_info = None
     metadata: dict[str, Any] = {}
     if source_type in {"youtube", "url"}:
-        meta = fetch_metadata(source_url)
-        metadata = meta.to_dict()
-        _update_project(
-            project_id,
-            title=meta.title,
-            channel=meta.channel,
-            duration=meta.duration,
-            thumbnail_url=meta.thumbnail_url,
-            source_id=meta.video_id,
-            description=(meta.description or "")[:4000],
-        )
-        paths.metadata.mkdir(parents=True, exist_ok=True)
-        (paths.metadata / "source.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=1), encoding="utf-8")
-        title = meta.title
+        source_metadata_path = paths.metadata / "source.json"
+        cached_metadata = None
+        try:
+            cached_metadata = json.loads(source_metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            cached_metadata = None
+        if isinstance(cached_metadata, dict) and cached_metadata.get("url") == source_url and cached_metadata.get("title"):
+            metadata = cached_metadata
+            title = str(metadata.get("title") or title)
+            _update_project(
+                project_id,
+                title=title,
+                channel=str(metadata.get("channel") or ""),
+                duration=float(metadata.get("duration") or 0.0),
+                thumbnail_url=str(metadata.get("thumbnail_url") or ""),
+                source_id=str(metadata.get("video_id") or ""),
+                description=str(metadata.get("description") or "")[:4000],
+            )
+            report.sub(1.0, "reusing cached video metadata")
+        else:
+            meta = fetch_metadata(source_url)
+            metadata = meta.to_dict()
+            _update_project(
+                project_id,
+                title=meta.title,
+                channel=meta.channel,
+                duration=meta.duration,
+                thumbnail_url=meta.thumbnail_url,
+                source_id=meta.video_id,
+                description=(meta.description or "")[:4000],
+            )
+            paths.metadata.mkdir(parents=True, exist_ok=True)
+            source_metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=1), encoding="utf-8")
+            title = meta.title
     else:
         existing = paths.source
         local = next((path for path in existing.iterdir() if path.is_file()), None) if existing.exists() else None
@@ -236,7 +298,7 @@ def analyze(
     report.stage("audio", "extracting audio for speech recognition", fraction=0.05)
     t0 = time.time()
     audio_path = paths.audio / "speech_16k.wav"
-    if audio_path.exists() and audio_path.stat().st_size > 1024 and not force:
+    if audio_path.exists() and audio_path.stat().st_size > 1024:
         report.sub(1.0, "reusing the cached audio track")
         report.log("audio track already extracted - reusing it")
     else:
@@ -247,11 +309,29 @@ def analyze(
     # ------------------------------------------------------------ 4. language
     report.stage("language", "detecting language", fraction=0.1)
     t0 = time.time()
-    language_profile = _detect_language(media_path, audio_path, paths, settings, metadata, report)
+    language_profile = _detect_language(
+        media_path, audio_path, paths, settings, metadata, report,
+        transcript_source=selected_transcript_source,
+        transcript_filename=selected_transcript_filename,
+    )
     mark("language", time.time() - t0, language=language_profile.primary, mode=language_profile.mode)
 
     # ---------------------------------------------------------- 5. transcribe
-    transcript = _transcribe(media_path, audio_path, paths, settings, metadata, report, language_profile)
+    transcript = _transcribe(
+        media_path, audio_path, paths, settings, metadata, report, language_profile,
+        preferred_source=selected_transcript_source,
+        preferred_filename=selected_transcript_filename,
+        force=force,
+    )
+    transcript_source = transcript.source
+    transcript_filename = transcript.filename
+    _update_project(
+        project_id,
+        transcript_source=transcript_source,
+        transcript_preference=transcript.source,
+        transcript_filename=transcript_filename,
+        transcript_timing=transcript.timing_granularity,
+    )
     for warning in transcript.warnings:
         report.log(warning)
     if transcript.translated:
@@ -276,7 +356,10 @@ def analyze(
     # ------------------------------------------------------------- 7. segment
     report.stage("segment", "splitting the transcript into thoughts and topics", fraction=0.2)
     t0 = time.time()
-    sentences = build_sentences(utterances)
+    sentences = build_sentences(
+        utterances,
+        preserve_cue_boundaries=transcript.timing_granularity == "cue",
+    )
     blocks = build_blocks(sentences)
     index = TranscriptIndex.build(sentences, blocks, transcript.duration or media_info.duration)
     save_transcript(
@@ -285,8 +368,20 @@ def analyze(
         language=transcript.language,
         engine=transcript.engine,
         model=transcript.model,
+        source=transcript.source,
+        filename=transcript.filename,
+        timing_granularity=transcript.timing_granularity,
     )
-    write_transcript_files(paths, sentences, language=transcript.language, engine=transcript.engine, model=transcript.model)
+    write_transcript_files(
+        paths,
+        sentences,
+        language=transcript.language,
+        engine=transcript.engine,
+        model=transcript.model,
+        source=transcript.source,
+        filename=transcript.filename,
+        timing_granularity=transcript.timing_granularity,
+    )
     write_analysis_files(paths, "segmentation", {"blocks": [block.to_dict() for block in blocks], "sentences": sentence_map(sentences)})
     mark("segment", time.time() - t0, sentences=len(sentences), blocks=len(blocks))
     report.sub(1.0, f"{len(sentences)} sentences in {len(blocks)} topic blocks")
@@ -306,6 +401,13 @@ def analyze(
             llm_result = None
 
     analyse_progress = lambda fraction, message: report.sub(fraction, message)  # noqa: E731
+    discovery_errors: list[str] = []
+
+    def on_discovery_error(start_index: int, end_index: int, exc: Exception) -> None:
+        discovery_errors.append(f"{start_index}:{end_index} {type(exc).__name__}: {exc}")
+        if len(discovery_errors) <= 8:
+            report.log(f"candidate scoring failed for sentence range {start_index}:{end_index}: {type(exc).__name__}: {exc}")
+
     candidates = discover_mod.generate_candidates(
         index,
         min_seconds=min_seconds,
@@ -313,11 +415,25 @@ def analyze(
         max_seconds=max_seconds,
         progress=analyse_progress,
         should_cancel=report.cancelled,
+        on_error=on_discovery_error,
     )
     heuristic_count = len(candidates)
     report.sub(0.75, f"{heuristic_count} candidate moments from the transcript analysis")
+    _persist_candidates(project_id, candidates, [])
+    _update_project(project_id, candidate_count=len(candidates))
+    _update_analysis_snapshot(
+        project_id,
+        diagnostics={
+            "discovered": len(candidates),
+            "scored": 0,
+            "scoring_errors": len(discovery_errors),
+        },
+        heuristic_candidates=heuristic_count,
+    )
 
     llm_note = ""
+    llm_diagnostics: dict[str, int] = {}
+    llm_merge_errors: list[str] = []
     if llm_result and llm_result.available:
         report.sub(0.78, f"asking {settings.ollama_model} for its own read of the transcript")
         try:
@@ -329,12 +445,29 @@ def analyze(
                 settings=settings,
                 progress=lambda fraction, message: report.sub(0.78 + 0.18 * fraction, message),
                 should_cancel=report.cancelled,
+                diagnostics=llm_diagnostics,
             )
         except ClipForgeError as exc:
             llm_note = f"Local model unavailable: {exc.message}"
             log.warning("LLM discovery failed: %s", exc.message)
+            report.log(llm_note)
         if llm_seeds:
-            candidates = discover_mod.merge_llm_seeds(index, candidates, llm_seeds, min_seconds, max_seconds, target_seconds)
+            def on_llm_merge_error(code: str, message: str) -> None:
+                llm_merge_errors.append(code)
+                report.log(message)
+
+            candidates = discover_mod.merge_llm_seeds(
+                index,
+                candidates,
+                llm_seeds,
+                min_seconds,
+                max_seconds,
+                target_seconds,
+                on_error=on_llm_merge_error,
+            )
+        if not llm_seeds and sum(llm_diagnostics.get(key, 0) for key in ("chunks_failed", "invalid_payloads", "invalid_moments", "invalid_scores")):
+            llm_note = "Ollama returned invalid or unscorable moments; see the analysis log for raw-output diagnostics."
+            report.log(llm_note)
     else:
         llm_note = (
             "Analytical mode: Ollama was not used "
@@ -342,8 +475,30 @@ def analyze(
         )
         report.log(llm_note)
 
-    mark("discover", time.time() - t0, heuristic=heuristic_count, llm=len(llm_seeds), merged=len(candidates))
-    report.sub(1.0, f"{len(candidates)} candidate moments discovered")
+    if llm_seeds:
+        _persist_candidates(project_id, candidates, [])
+    _update_project(project_id, candidate_count=len(candidates))
+    _update_analysis_snapshot(
+        project_id,
+        diagnostics={
+            "discovered": len(candidates),
+            "scoring_errors": len(discovery_errors) + len(llm_merge_errors),
+            "llm_parse_errors": sum(llm_diagnostics.get(key, 0) for key in ("invalid_payloads", "invalid_moments", "invalid_scores")),
+        },
+        heuristic_candidates=heuristic_count,
+        llm_candidates=len(llm_seeds),
+        llm_diagnostics=llm_diagnostics,
+    )
+    mark(
+        "discover",
+        time.time() - t0,
+        heuristic=heuristic_count,
+        llm=len(llm_seeds),
+        merged=len(candidates),
+        scoring_errors=len(discovery_errors) + len(llm_merge_errors),
+        llm_diagnostics=llm_diagnostics,
+    )
+    report.sub(1.0, f"{len(candidates)} candidate moments discovered · {len(discovery_errors) + len(llm_merge_errors)} scoring errors")
 
     # --------------------------------------------------------------- 9. score
     report.stage("score", "scoring every candidate", fraction=0.1)
@@ -363,20 +518,65 @@ def analyze(
         mode=settings.clip_mode,
         max_clips=settings.max_clips,
         optimize=True,
+        debug_mode=settings.debug_mode,
         on_phase=on_phase,
     )
     selected = result["selected"]
+    score_report = result["report"]
+    total_scoring_errors = len(discovery_errors) + len(llm_merge_errors) + int(score_report.get("scoring_errors", 0))
     report.stage("boundaries", "boundaries optimised", fraction=1.0)
-    report.sub(1.0, f"{len(selected)} clips passed the quality gate")
-    mark("score", time.time() - t0, **result["report"])
+    report.sub(1.0, f"{len(selected)} clips accepted · {total_scoring_errors} scoring errors")
+    report.log(
+        "analysis counts: "
+        f"discovered={len(candidates)}, scored={score_report.get('scored', 0)}, "
+        f"threshold_pass={score_report.get('threshold_pass', 0)}, "
+        f"context_rejections={score_report.get('rejected_context', 0)}, "
+        f"overlap_rejections={score_report.get('overlap_rejections', 0)}, "
+        f"final_accepted={len(selected)}, threshold={score_report.get('min_score', settings.min_score):.1f}"
+    )
+    if not selected:
+        reason_counts = score_report.get("rejection_reasons") or {}
+        top_reason = max(reason_counts, key=reason_counts.get) if reason_counts else "no_candidate_passed_validation"
+        report.log(
+            f"zero accepted clips: candidates={len(candidates)}, average_score={score_report.get('average_score', 0):.1f}, "
+            f"highest_score={score_report.get('highest_score', 0):.1f}, "
+            f"threshold={score_report.get('min_score', settings.min_score):.1f}, top_rejection={top_reason}"
+        )
+    _update_analysis_snapshot(
+        project_id,
+        diagnostics={
+            "discovered": len(candidates),
+            "scored": int(score_report.get("scored", 0)),
+            "scoring_errors": total_scoring_errors,
+            "threshold_pass": int(score_report.get("threshold_pass", 0)),
+            "threshold": float(score_report.get("min_score", settings.min_score)),
+            "context_rejections": int(score_report.get("rejected_context", 0)),
+            "overlap_rejections": int(score_report.get("overlap_rejections", 0)),
+            "final_accepted": len(selected),
+            "average_score": float(score_report.get("average_score", 0.0)),
+            "highest_score": float(score_report.get("highest_score", 0.0)),
+            "top_rejection_reason": top_reason if not selected else "",
+            "debug_mode": settings.debug_mode,
+        },
+        scoring=score_report,
+    )
+    mark("score", time.time() - t0, **score_report, total_scoring_errors=total_scoring_errors)
 
     # ---------------------------------------------------------- 10. persist
     report.stage("prepare", "preparing clips, captions and framing", fraction=0.05)
     t0 = time.time()
-    stored_candidates = sorted(result["kept"] + result["duplicates"], key=lambda item: -item.score)[: discover_mod.MAX_STORED_CANDIDATES]
-    _persist_candidates(project_id, stored_candidates, selected)
+    _persist_candidates(project_id, candidates, selected)
+    stored_candidate_count = min(len(candidates), discover_mod.MAX_STORED_CANDIDATES)
     clip_ids = _persist_clips(project_id, selected, paths, index, settings, language_profile)
-    mark("prepare", time.time() - t0, candidates=len(stored_candidates), clips=len(clip_ids))
+    _update_project(project_id, candidate_count=len(candidates), clip_count=len(clip_ids))
+    _update_analysis_snapshot(
+        project_id,
+        diagnostics={"final_accepted": len(clip_ids), "queued": 0, "rendered": 0},
+        persisted_candidates=stored_candidate_count,
+        accepted_clip_records=len(clip_ids),
+        render_jobs_queued=0,
+    )
+    mark("prepare", time.time() - t0, candidates=stored_candidate_count, clips=len(clip_ids), render_jobs_queued=0)
 
     # ---------------------------------------------------------- 11. finalise
     write_analysis_files(
@@ -387,6 +587,18 @@ def analyze(
             "kept": len(result["kept"]),
             "duplicates": len(result["duplicates"]),
             "selected": len(selected),
+            "diagnostics": {
+                "discovered": len(candidates),
+                "scored": int(score_report.get("scored", 0)),
+                "scoring_errors": total_scoring_errors,
+                "threshold_pass": int(score_report.get("threshold_pass", 0)),
+                "context_rejections": int(score_report.get("rejected_context", 0)),
+                "overlap_rejections": int(score_report.get("overlap_rejections", 0)),
+                "final_accepted": len(selected),
+                "threshold": float(score_report.get("min_score", settings.min_score)),
+                "average_score": float(score_report.get("average_score", 0.0)),
+                "highest_score": float(score_report.get("highest_score", 0.0)),
+            },
             "report": result["report"],
             "top": [candidate.to_dict() for candidate in selected[:50]],
         },
@@ -400,6 +612,20 @@ def analyze(
             "selected_clips": len(selected),
             "audio_seconds": round(audio_seconds, 2),
             "diarization": diarization,
+            "diagnostics": {
+                "discovered": len(candidates),
+                "scored": int(score_report.get("scored", 0)),
+                "scoring_errors": total_scoring_errors,
+                "threshold_pass": int(score_report.get("threshold_pass", 0)),
+                "context_rejections": int(score_report.get("rejected_context", 0)),
+                "overlap_rejections": int(score_report.get("overlap_rejections", 0)),
+                "final_accepted": len(selected),
+                "queued": 0,
+                "rendered": 0,
+                "threshold": float(score_report.get("min_score", settings.min_score)),
+                "average_score": float(score_report.get("average_score", 0.0)),
+                "highest_score": float(score_report.get("highest_score", 0.0)),
+            },
             "llm": llm_result.to_dict() if llm_result else None,
             "llm_note": llm_note,
         }
@@ -417,7 +643,7 @@ def analyze(
             project.status = "ready"
             project.stage = "ready"
             project.progress = 1.0
-            project.status_message = f"{len(selected)} clips ready"
+            project.status_message = f"{len(selected)} accepted clips ready to render"
             project.language = language_profile.primary
             project.language_secondary = language_profile.secondary
             project.language_mode = language_profile.mode
@@ -429,9 +655,6 @@ def analyze(
             project.error_code = ""
             project.error_message = ""
             project.error_hint = ""
-
-    if not settings.keep_source_audio:
-        _remove_extracted_audio(paths)
 
     log.info(
         "analysis finished for %s: %d candidates -> %d clips in %.1fs",
@@ -532,6 +755,92 @@ def _download_source(
     return downloaded
 
 
+def _provided_transcript_file(
+    paths: ProjectPaths,
+    *,
+    preferred_source: str = "",
+    preferred_filename: str = "",
+    allow_legacy: bool = False,
+) -> Path | None:
+    """Resolve only a user-supplied transcript, never a downloaded caption track."""
+    if preferred_source == "whisper" or preferred_source == "source_captions":
+        return None
+    extension = Path(preferred_filename).suffix.lower()
+    if extension in {".srt", ".vtt", ".json3", ".txt"}:
+        target = paths.transcript / f"provided{extension}"
+        if target.is_file():
+            return target
+        if preferred_source.startswith("uploaded_"):
+            raise ClipForgeError(
+                code=ErrorCode.TRANSCRIPTION_FAILED,
+                message="The uploaded transcript is missing from this project.",
+                hint="Attach the subtitle file again; CLIPFORGE will not silently replace it with speech recognition.",
+                status_code=409,
+            )
+    provided = [
+        path for path in transcript_files(paths.transcript)
+        if path.stem.lower().startswith("provided")
+    ]
+    if provided:
+        return provided[0]
+    if allow_legacy and not preferred_source:
+        # Backwards compatibility for projects created before transcript source
+        # metadata existed. Explicitly named downloaded caption tracks are excluded.
+        legacy = [
+            path for path in transcript_files(paths.transcript)
+            if not path.stem.lower().startswith(("captions", "auto", "source"))
+        ]
+        return legacy[0] if legacy else None
+    return None
+
+
+def _language_cache_key(
+    audio_path: Path,
+    settings: AppSettings,
+    *,
+    transcript_source: str,
+    transcript_filename: str,
+    transcript_path: Path | None,
+) -> dict[str, Any]:
+    """Fingerprint the exact transcript/audio and language settings for reuse."""
+    transcript_hash = ""
+    if transcript_path is not None:
+        try:
+            transcript_hash = hashlib.sha256(transcript_path.read_bytes()).hexdigest()
+        except OSError:
+            transcript_hash = "missing"
+    try:
+        audio_stat = audio_path.stat()
+        audio_fingerprint = {"name": audio_path.name, "size": audio_stat.st_size, "mtime_ns": audio_stat.st_mtime_ns}
+    except OSError:
+        audio_fingerprint = {"name": audio_path.name, "size": 0, "mtime_ns": 0}
+    return {
+        "source": transcript_source,
+        "filename": transcript_filename,
+        "transcript_sha256": transcript_hash,
+        "audio": audio_fingerprint,
+        "whisper_model": settings.whisper_model,
+        "language_hint": settings.language_hint,
+    }
+
+
+def _language_profile_from_dict(payload: dict[str, Any]) -> language_mod.LanguageProfile:
+    return language_mod.LanguageProfile(
+        primary=str(payload.get("primary") or "en"),
+        primary_name=str(payload.get("primary_name") or "English"),
+        secondary=str(payload.get("secondary") or ""),
+        secondary_name=str(payload.get("secondary_name") or ""),
+        mode=str(payload.get("mode") or "monolingual"),
+        confidence=float(payload.get("confidence") or 0.0),
+        whistle_language=str(payload.get("whisper_language") or ""),
+        probabilities=dict(payload.get("probabilities") or {}),
+        script=dict(payload.get("script") or {}),
+        hinglish_score=float(payload.get("hinglish_score") or 0.0),
+        secondary_share=float(payload.get("secondary_share") or 0.0),
+        notes=list(payload.get("notes") or []),
+    )
+
+
 def _detect_language(
     media_path: Path,
     audio_path: Path,
@@ -539,24 +848,68 @@ def _detect_language(
     settings: AppSettings,
     metadata: dict[str, Any],
     report: ProgressReporter,
+    *,
+    transcript_source: str = "",
+    transcript_filename: str = "",
 ) -> language_mod.LanguageProfile:
-    """Fast language probe on the first minutes, then script/lexical analysis."""
+    """Read language from an authoritative user transcript before probing audio."""
+    allow_legacy = not transcript_source
     probe_seconds = 150.0
     whisper_language = ""
     confidence = 0.0
     probabilities: dict[str, float] = {}
     sample_text = ""
 
-    # A transcript the user supplied is both faster and more accurate than a
-    # 150-second ASR probe, so it wins here too.
-    from ..media.download import parse_transcript_file, transcript_files
+    provided = _provided_transcript_file(
+        paths,
+        preferred_source=transcript_source,
+        preferred_filename=transcript_filename,
+        allow_legacy=allow_legacy,
+    )
+    cache_source = transcript_source or (f"uploaded_{provided.suffix.lower().lstrip('.')}" if provided else "whisper")
+    cache_filename = transcript_filename or (provided.name if provided else "")
+    cache_key = _language_cache_key(
+        audio_path,
+        settings,
+        transcript_source=cache_source,
+        transcript_filename=cache_filename,
+        transcript_path=provided,
+    )
+    language_cache = paths.analysis / "language.json"
+    cacheable_language = not (not transcript_source and provided is not None and not provided.stem.lower().startswith("provided"))
+    try:
+        cached_language = json.loads(language_cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        cached_language = None
+    if cacheable_language and isinstance(cached_language, dict) and cached_language.get("_cache_key") == cache_key:
+        profile_payload = {key: value for key, value in cached_language.items() if key != "_cache_key"}
+        report.sub(1.0, "reusing cached language analysis")
+        report.log("language detection reused the cached result for the same transcript/audio and settings")
+        return _language_profile_from_dict(profile_payload)
 
-    provided = transcript_files(paths.transcript)
-    if provided:
-        words = parse_transcript_file(provided[0])
-        sample_text = " ".join(item["word"] for item in words[:1200])
-        report.sub(0.6, f"language read from {provided[0].name}")
-        report.log(f"language detection used the provided transcript ({provided[0].name})")
+    if provided is not None:
+        candidates = [provided]
+        if not transcript_source and allow_legacy and not provided.stem.lower().startswith("provided"):
+            candidates = [
+                path for path in transcript_files(paths.transcript)
+                if not path.stem.lower().startswith(("captions", "auto", "source", "provided"))
+            ]
+        for candidate in candidates:
+            cues = parse_transcript_segments(candidate)
+            if cues:
+                provided = candidate
+                sample_text = " ".join(item["text"] for item in cues[:1200])
+                break
+        if sample_text:
+            report.sub(0.6, f"language read from uploaded transcript ({transcript_filename or provided.name})")
+            report.log(f"language detection used the uploaded transcript ({transcript_filename or provided.name}); Whisper probe skipped")
+        elif transcript_source.startswith("uploaded_"):
+            raise ClipForgeError(
+                code=ErrorCode.INVALID_INPUT,
+                message="The uploaded transcript contains no valid timestamped cues.",
+                hint="Check the SRT/VTT timestamps and attach the file again.",
+                status_code=422,
+            )
 
     if not sample_text and transcription_available():
         try:
@@ -589,7 +942,10 @@ def _detect_language(
         profile.primary = settings.language_hint.split("-")[0]
         profile.primary_name = language_mod.language_name(profile.primary)
         profile.notes.append(f"Language forced to {profile.primary_name} in Settings -> Transcription.")
-    write_analysis_files(paths, "language", profile.to_dict())
+    language_payload = profile.to_dict()
+    if cacheable_language:
+        language_payload["_cache_key"] = cache_key
+    write_analysis_files(paths, "language", language_payload)
     return profile
 
 
@@ -601,21 +957,42 @@ def _transcribe(
     metadata: dict[str, Any],
     report: ProgressReporter,
     profile: language_mod.LanguageProfile,
+    *,
+    preferred_source: str = "",
+    preferred_filename: str = "",
+    force: bool = False,
 ) -> Transcript:
-    report.stage("transcribe", "running local speech recognition", fraction=0.0)
+    supplied_path = _provided_transcript_file(
+        paths,
+        preferred_source=preferred_source,
+        preferred_filename=preferred_filename,
+        allow_legacy=not preferred_source,
+    )
+    user_source = preferred_source.startswith("uploaded_") or supplied_path is not None
+    report.stage(
+        "transcribe",
+        "loading the uploaded transcript (Whisper skipped)" if user_source else "running Whisper speech recognition",
+        fraction=0.0,
+    )
 
-    # 1. A transcript the user supplied for this project wins over everything:
-    #    they already have captions, so re-recognising would only lose accuracy.
-    provided = _transcript_from_files(paths, settings, report, profile)
+    provided = _transcript_from_files(
+        paths,
+        settings,
+        report,
+        profile,
+        preferred_source=preferred_source,
+        preferred_filename=preferred_filename,
+        allow_legacy=not preferred_source,
+    )
     if provided is not None:
         return provided
 
     if transcription_available():
         cache_key = _transcript_cache_key(media_path, settings)
-        if settings.cache_transcripts:
+        if settings.cache_transcripts and not force:
             cached = _load_cached_transcript(paths, cache_key)
             if cached is not None:
-                report.sub(1.0, f"reusing the transcript from the previous analysis ({cached.word_count} words)")
+                report.sub(1.0, f"reusing the cached Whisper transcript ({cached.word_count} words)")
                 report.log("speech recognition skipped: the cached transcript matches this source and these settings")
                 return cached
         try:
@@ -625,8 +1002,10 @@ def _transcribe(
                 progress=lambda fraction, message: report.sub(fraction, message),
                 should_cancel=report.cancelled,
             )
+            transcript.source = "whisper"
+            transcript.timing_granularity = "word" if any(utterance.words for utterance in transcript.utterances) else "cue"
             (paths.transcript / "engine.json").write_text(
-                json.dumps({"engine": transcript.engine, "model": transcript.model, "language": transcript.language}, indent=1),
+                json.dumps({"engine": transcript.engine, "model": transcript.model, "language": transcript.language, "source": transcript.source}, indent=1),
                 encoding="utf-8",
             )
             if settings.cache_transcripts:
@@ -671,7 +1050,12 @@ def _load_cached_transcript(paths: ProjectPaths, key: dict[str, Any]) -> Transcr
         payload = json.loads(cache_file.read_text(encoding="utf-8"))
         if payload.get("key") != key:
             return None
-        return Transcript.from_dict(payload["transcript"])
+        cached_transcript = payload["transcript"]
+        engine = str(cached_transcript.get("engine", "")).lower()
+        if "transcript-file" in engine or ("caption" in engine and "timing_granularity" not in cached_transcript):
+            log.info("ignoring legacy transcript cache with estimated word timestamps; reload the original cue file or transcribe again")
+            return None
+        return Transcript.from_dict(cached_transcript)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         log.warning("ignoring unreadable transcript cache %s: %s", cache_file, exc)
         return None
@@ -705,78 +1089,83 @@ def _translated_profile(profile: language_mod.LanguageProfile, transcript: Trans
     )
 
 
-def _remove_extracted_audio(paths: ProjectPaths) -> None:
-    """Drop the speech-recognition WAVs (``keep_source_audio`` off); re-analysis re-extracts them."""
-    for name in ("speech_16k.wav", "language_probe.wav"):
-        try:
-            (paths.audio / name).unlink(missing_ok=True)
-        except OSError as exc:
-            log.debug("could not remove %s: %s", name, exc)
-
-
 def _transcript_from_files(
     paths: ProjectPaths,
     settings: AppSettings,
     report: ProgressReporter,
     profile: language_mod.LanguageProfile,
+    *,
+    preferred_source: str = "",
+    preferred_filename: str = "",
+    allow_legacy: bool = False,
 ) -> Transcript | None:
-    """Build a transcript from a caption/transcript file the user provided.
-
-    Supported: ``.json3`` (YouTube), ``.srt``, ``.vtt`` and ``.txt`` with
-    ``[hh:mm:ss]`` stamps, dropped in the project's ``transcript/`` folder or
-    uploaded through the API. Word-level timings inside a subtitle cue are
-    estimated (and reported as such) - accuracy is lower than local ASR, which is
-    why this only happens when the user supplies the file.
-    """
-    from ..media.download import parse_transcript_file, transcript_files
-
-    candidates = transcript_files(paths.transcript)
-    if not candidates:
+    """Load an authoritative user transcript as cue-level timed text."""
+    source = _provided_transcript_file(
+        paths,
+        preferred_source=preferred_source,
+        preferred_filename=preferred_filename,
+        allow_legacy=allow_legacy,
+    )
+    if source is None:
         return None
 
-    source = candidates[0]
-    words: list[dict[str, Any]] = []
+    strict_user_file = preferred_source.startswith("uploaded_") or source.stem.lower().startswith("provided")
+    candidates = [source]
+    if allow_legacy and not preferred_source and not strict_user_file:
+        candidates = [
+            path for path in transcript_files(paths.transcript)
+            if not path.stem.lower().startswith(("captions", "auto", "source", "provided"))
+        ]
+    cues: list[dict[str, Any]] = []
     for candidate in candidates:
-        # A file can pass the extension/size filter and still hold no cues, so work
-        # down the priority list until one of them actually yields words.
-        parsed = parse_transcript_file(candidate)
+        parsed = parse_transcript_segments(candidate)
         if parsed:
-            source, words = candidate, parsed
+            source, cues = candidate, parsed
             break
-        report.log(f"{candidate.name} contained no readable timings - trying the next transcript file")
-        log.warning("provided transcript %s could not be parsed", candidate)
-
-    if not words:
-        report.log("none of the supplied transcript files contained readable timings - falling back to speech recognition")
+        report.log(f"{candidate.name} did not contain readable transcript cues")
+    if not cues:
+        if strict_user_file:
+            raise ClipForgeError(
+                code=ErrorCode.INVALID_INPUT,
+                message=f"The uploaded transcript {preferred_filename or source.name} contains no valid timed cues.",
+                hint="Check that the file contains valid timestamps and text, then attach it again.",
+                status_code=422,
+            )
         return None
 
-    report.sub(0.05, f"using the transcript file you provided ({source.name})")
-
-    from ..ai.transcribe import Word
-
-    utterances: list[Utterance] = []
-    buffer: list[Word] = []
-    for item in words:
-        buffer.append(Word(word=item["word"], start=item["start"], end=item["end"], confidence=item.get("confidence", 0.6)))
-        if len(buffer) >= 14 or (buffer and item["end"] - buffer[0].start > 7.0):
-            utterances.append(_utterance_from_words(buffer))
-            buffer = []
-    if buffer:
-        utterances.append(_utterance_from_words(buffer))
-
-    duration = utterances[-1].end if utterances else 0.0
-    report.sub(0.9, f"{len(words)} words loaded from {source.name}")
-    report.log(f"transcript supplied by the user: {source.name} ({len(words)} words, {duration / 60:.1f} min)")
+    source_code = preferred_source or f"uploaded_{source.suffix.lower().lstrip('.') or 'txt'}"
+    original_filename = preferred_filename or source.name
+    utterances = [
+        Utterance(
+            text=cue["text"],
+            start=float(cue["start"]),
+            end=float(cue["end"]),
+            speaker="SPEAKER_01",
+            confidence=1.0,
+            words=[],
+        )
+        for cue in cues
+    ]
+    duration = max((utterance.end for utterance in utterances), default=0.0)
+    word_count = sum(len(utterance.text.split()) for utterance in utterances)
+    report.sub(0.9, f"{len(cues)} transcript cues loaded from {original_filename}; Whisper skipped")
+    report.log(
+        f"authoritative user transcript: {original_filename} ({len(cues)} cues, {word_count} words, "
+        f"{duration / 60:.1f} min); cue timestamps preserved and no word timings fabricated"
+    )
     return Transcript(
         language=profile.primary or "en",
         language_confidence=profile.confidence,
         utterances=utterances,
-        engine="transcript-file",
-        model=source.name,
+        engine="uploaded transcript",
+        model=original_filename,
         duration=duration,
         diarized=False,
         speaker_count=1,
-        warnings=[f"Transcript read from {source.name}; word timings inside each cue are estimated."],
+        warnings=["Uploaded transcript used as authoritative cue-level text; no per-word timing was invented."],
+        source=source_code,
+        filename=original_filename,
+        timing_granularity="cue",
     )
 
 
@@ -787,7 +1176,7 @@ def _transcribe_from_captions(
     report: ProgressReporter,
     profile: language_mod.LanguageProfile,
 ) -> Transcript:
-    """Fallback: use the source's own caption track (clearly labelled as external)."""
+    """Fallback: use the source's own caption track, clearly distinct from Whisper."""
     url = metadata.get("url") or metadata.get("webpage_url") or ""
     caption_file: Path | None = None
     if url:
@@ -811,8 +1200,8 @@ def _transcribe_from_captions(
             status_code=503,
         )
 
-    words = parse_transcript_file(caption_file)
-    if not words:
+    cues = parse_transcript_segments(caption_file)
+    if not cues:
         raise ClipForgeError(
             code=ErrorCode.NO_SPEECH,
             message="The downloaded caption track was empty or unreadable.",
@@ -820,31 +1209,35 @@ def _transcribe_from_captions(
             status_code=422,
         )
 
-    from ..ai.transcribe import Word
-
-    utterances: list[Utterance] = []
-    buffer: list[Word] = []
-    for item in words:
-        buffer.append(
-            Word(word=item["word"], start=item["start"], end=item["end"], confidence=item.get("confidence", 0.6))
+    utterances = [
+        Utterance(
+            text=cue["text"],
+            start=float(cue["start"]),
+            end=float(cue["end"]),
+            speaker="SPEAKER_01",
+            confidence=0.8,
+            words=[],
         )
-        if len(buffer) >= 12 or (buffer and item["end"] - buffer[0].start > 6.0):
-            utterances.append(_utterance_from_words(buffer))
-            buffer = []
-    if buffer:
-        utterances.append(_utterance_from_words(buffer))
-
-    report.log("transcript built from the video's own caption track (external captions, word timings estimated)")
+        for cue in cues
+    ]
+    word_count = sum(len(utterance.text.split()) for utterance in utterances)
+    report.log(
+        f"transcript built from source caption track {caption_file.name} ({len(cues)} cues); "
+        "caption cue timings preserved, no word timings fabricated"
+    )
     return Transcript(
         language=profile.primary or "en",
         language_confidence=profile.confidence,
         utterances=utterances,
-        engine="source captions (fallback)",
-        model="caption-track",
-        duration=utterances[-1].end if utterances else 0.0,
+        engine="source caption track",
+        model=caption_file.name,
+        duration=max((utterance.end for utterance in utterances), default=0.0),
         diarized=False,
         speaker_count=1,
-        warnings=["Captions came from the video's caption track because no local ASR engine is installed."],
+        warnings=["These are the video's downloaded caption cues, not a Whisper transcript."],
+        source="source_captions",
+        filename=caption_file.name,
+        timing_granularity="cue",
     )
 
 
@@ -867,12 +1260,20 @@ def _utterance_from_words(words: Sequence[Any]) -> Utterance:
 
 
 def _persist_candidates(project_id: str, candidates: Sequence[Any], selected: Sequence[Any]) -> None:
+    """Persist discovered, scored, rejected and selected candidates separately from clips."""
     from ..db import Candidate as CandidateRow
 
     selected_keys = {f"{candidate.start_index}:{candidate.end_index}" for candidate in selected}
+    ordered = sorted(candidates, key=lambda item: (-item.score, item.start))
+    if len(ordered) > discover_mod.MAX_STORED_CANDIDATES:
+        selected_candidates = [item for item in ordered if item.key() in selected_keys]
+        selected_ids = {id(item) for item in selected_candidates}
+        remaining = [item for item in ordered if id(item) not in selected_ids]
+        ordered = (selected_candidates + remaining)[: discover_mod.MAX_STORED_CANDIDATES]
+
     with session_scope() as session:
         session.query(CandidateRow).filter(CandidateRow.project_id == project_id).delete()
-        for order, candidate in enumerate(candidates):
+        for order, candidate in enumerate(ordered):
             session.add(
                 CandidateRow(
                     project_id=project_id,
@@ -885,6 +1286,7 @@ def _persist_candidates(project_id: str, candidates: Sequence[Any], selected: Se
                     summary=candidate.summary,
                     category=candidate.category,
                     reason=candidate.reason,
+                    rejection_code=candidate.rejection_code,
                     score=candidate.score,
                     confidence=candidate.confidence,
                     factors_json=json.dumps(candidate.features.factors),

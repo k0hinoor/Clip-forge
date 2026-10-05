@@ -45,6 +45,7 @@ class ClipOptions(BaseModel):
     min_clip_seconds: float = Field(35.0, ge=5, le=120)
     max_clip_seconds: float = Field(75.0, ge=15, le=300)
     min_score: float = Field(70.0, ge=0, le=100)
+    debug_mode: bool = False
     max_clips: int = Field(0, ge=0, le=500, description="0 = unlimited")
     aspect_ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
     caption_preset: str = "bold_creator"  # see constants.CAPTION_PRESETS
@@ -108,7 +109,7 @@ class ProjectAnalyzeRequest(BaseModel):
 
     options: ClipOptions | None = None
     priority: int = Field(1, ge=0, le=10)
-    force: bool = Field(False, description="Re-extract audio and ignore cached transcripts")
+    force: bool = Field(False, description="Ignore the cached Whisper transcript and transcribe again; an attached user transcript remains authoritative")
 
 
 class RenderAllRequest(BaseModel):

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Download, FileText, FolderOpen, Loader2, Play, Square } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Download, FileText, FolderOpen, Loader2, Mic, Play, RefreshCw, Square } from "lucide-react";
 import { api } from "@/lib/api";
 import { isProjectEvent, useLiveRefresh } from "@/lib/live";
 import { useSystem } from "@/components/System";
@@ -29,6 +29,7 @@ export default function ProjectPage() {
   const [busy, setBusy] = useState(false);
   const [missing, setMissing] = useState(false);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [debugMode, setDebugMode] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const loadStatus = useCallback(async () => {
@@ -74,14 +75,16 @@ export default function ProjectPage() {
 
   const project = status?.project;
   const analysing = isAnalysing(project?.status);
+  const diagnostics = status?.candidates;
+  const configuredThreshold = Number(project?.settings?.min_score ?? diagnostics?.threshold ?? 70);
   const chosen = useMemo(() => clips.filter((clip) => selected[clip.id]).map((clip) => clip.id), [clips, selected]);
   const unrendered = clips.filter((clip) => !["rendered", "queued", "rendering"].includes(clip.status)).length;
 
-  const analyse = async () => {
-    if (clips.length && !window.confirm("Re-analysing replaces the current clips and their edits. Continue?")) return;
+  const analyse = async (options?: Record<string, unknown>, force = false) => {
+    if (clips.length && !window.confirm("Re-analysing replaces the current accepted clips and their edits. Continue?")) return;
     setBusy(true);
     try {
-      await api.analyze(projectId);
+      await api.analyze(projectId, options, force);
       toast.ok("Analysis queued");
       await load(true);
     } catch (error) {
@@ -90,6 +93,30 @@ export default function ProjectPage() {
       setBusy(false);
     }
   };
+
+  const lowerThresholdAndReanalyse = async () => {
+    const next = Math.max(0, configuredThreshold - 10);
+    await analyse({ min_score: next, debug_mode: false });
+  };
+
+  const runDebugAnalysis = async () => {
+    await analyse({ debug_mode: debugMode, ...(debugMode ? { min_score: 0 } : {}) });
+  };
+
+  const useWhisper = async () => {
+    setBusy(true);
+    try {
+      const result = await api.useWhisper(projectId);
+      toast.ok("Whisper selected", result.message);
+      await load(true);
+    } catch (error) {
+      toast.fail(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retranscribeAnyway = async () => analyse(undefined, true);
 
   const cancel = async () => {
     try {
@@ -130,8 +157,13 @@ export default function ProjectPage() {
   const attachTranscript = async (file: File) => {
     try {
       const result = await api.uploadTranscript(projectId, file);
+      setSelected({});
+      setTab("transcript");
       toast.ok("Transcript attached", result.message);
-      await load(true);
+      await Promise.all([
+        load(true),
+        api.transcript(projectId, false).then(setTranscript).catch(() => undefined),
+      ]);
     } catch (error) {
       toast.fail(error);
     } finally {
@@ -190,8 +222,8 @@ export default function ProjectPage() {
               <Square size={13} /> Cancel
             </button>
           ) : (
-            <button type="button" className="btn btn-secondary" onClick={analyse} disabled={busy || !project}>
-              {project?.clip_count ? "Re-analyse" : "Analyse"}
+            <button type="button" className="btn btn-secondary" onClick={() => analyse()} disabled={busy || !project}>
+              {project?.clip_count || project?.status === "ready" ? "Re-analyse" : "Analyse"}
             </button>
           )}
           {features.open_folder ? (
@@ -235,6 +267,18 @@ export default function ProjectPage() {
               <StageList stages={stages} />
             </div>
           ) : null}
+          {diagnostics && (diagnostics.discovered > 0 || analysing) ? (
+            <div className="mt-4 grid grid-cols-2 gap-2 border-t border-line pt-3 text-[11px] sm:grid-cols-4">
+              <Count label="Discovered" value={diagnostics.discovered} />
+              <Count label="Scored" value={diagnostics.scored} />
+              <Count label="Threshold pass" value={diagnostics.threshold_pass} />
+              <Count label="Accepted" value={diagnostics.final_accepted} />
+              <Count label="Scoring errors" value={diagnostics.scoring_errors} warn={diagnostics.scoring_errors > 0} />
+              <Count label="Context rejected" value={diagnostics.context_rejections} />
+              <Count label="Overlap rejected" value={diagnostics.overlap_rejections} />
+              <Count label="Render queue / done" value={`${diagnostics.queued} / ${diagnostics.rendered}`} />
+            </div>
+          ) : null}
         </div>
 
         <div className="card space-y-3 p-4">
@@ -244,10 +288,33 @@ export default function ProjectPage() {
           ) : (
             <p className="text-xs text-text-3">The source appears here once it has been downloaded.</p>
           )}
-          <div>
-            <button type="button" className="btn btn-secondary btn-sm" onClick={() => fileInput.current?.click()} disabled={analysing}>
-              <FileText size={13} /> Attach transcript
+          {project?.transcript_source ? (
+            <div className="rounded-md border border-line bg-surface-2 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                <span className="chip chip-good">{transcriptSourceLabel(project.transcript_source)}</span>
+                {project.transcript_filename ? <span className="text-text-2">{project.transcript_filename}</span> : null}
+              </div>
+              <p className="mt-1.5 text-[11px] text-text-3">
+                {(project.segment_count ?? 0).toLocaleString()} segments · {(project.word_count ?? 0).toLocaleString()} words · {project.transcript_timing === "cue" ? "cue timing; no word timings" : "word timing"}
+              </p>
+              {project.transcript_preference === "whisper" && project.transcript_source.startsWith("uploaded_") ? (
+                <p className="mt-1 text-[11px] text-warn">Whisper is selected for the next run; the saved transcript remains this upload until Whisper succeeds.</p>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => fileInput.current?.click()} disabled={analysing || busy}>
+              <FileText size={13} /> {project?.transcript_source.startsWith("uploaded_") ? "Replace transcript" : "Attach transcript"}
             </button>
+            {(project?.transcript_source.startsWith("uploaded_") || project?.transcript_source === "source_captions") ? (
+              <button type="button" className="btn btn-ghost btn-sm" onClick={useWhisper} disabled={analysing || busy || project.transcript_preference === "whisper"}>
+                <Mic size={13} /> Use Whisper instead
+              </button>
+            ) : project?.transcript_source === "whisper" ? (
+              <button type="button" className="btn btn-ghost btn-sm" onClick={retranscribeAnyway} disabled={analysing || busy}>
+                <RefreshCw size={13} /> Re-transcribe anyway
+              </button>
+            ) : null}
             <input
               ref={fileInput}
               type="file"
@@ -255,13 +322,49 @@ export default function ProjectPage() {
               hidden
               onChange={(event) => event.target.files?.[0] && attachTranscript(event.target.files[0])}
             />
-            <p className="mt-2 text-[11px] leading-relaxed text-text-3">
-              Have accurate captions already? Attach an .srt, .vtt, .json3 or timestamped .txt and the next analysis uses it
-              instead of speech recognition.
-            </p>
           </div>
+          <p className="text-[11px] leading-relaxed text-text-3">
+            An uploaded .srt, .vtt, .json3 or timestamped .txt is authoritative: its cue text and timestamps are used for analysis and captions. Whisper is skipped unless you explicitly choose it.
+          </p>
         </div>
       </section>
+
+      {project?.status === "ready" && clips.length === 0 ? (
+        <section className="card border border-warn/40 bg-warn/5 p-4">
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={17} className="mt-0.5 shrink-0 text-warn" />
+            <div className="min-w-0 flex-1">
+              <h2 className="text-sm font-semibold text-text">Analysis finished with no accepted clips</h2>
+              <p className="mt-1 text-xs leading-relaxed text-text-2">
+                {diagnostics?.discovered
+                  ? `${diagnostics.discovered} candidates were found; ${diagnostics.scored} scored successfully. Average score ${diagnostics.average_score.toFixed(1)}/100, highest ${diagnostics.highest_score.toFixed(1)}/100, threshold ${diagnostics.threshold.toFixed(1)}. `
+                  : "No valid candidate windows were found in the transcript. "}
+                {diagnostics?.top_rejection_reason
+                  ? `Most common rejection: ${rejectionLabel(diagnostics.top_rejection_reason)}.`
+                  : diagnostics?.scoring_errors
+                    ? `${diagnostics.scoring_errors} scoring/parsing errors were recorded; see Considered for candidates and the analysis log for details.`
+                    : "Timestamp, overlap, threshold and context diagnostics are available below."}
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => setTab("rejected")}>
+                  View {diagnostics?.stored ?? candidates.length} considered
+                </button>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={lowerThresholdAndReanalyse} disabled={busy || configuredThreshold <= 0}>
+                  Lower threshold by 10 and re-analyse
+                </button>
+                <label className="flex cursor-pointer items-center gap-2 rounded border border-line px-2.5 py-1.5 text-[11px] text-text-2">
+                  <input type="checkbox" checked={debugMode} onChange={(event) => setDebugMode(event.target.checked)} className="accent-accent" />
+                  Debug mode (threshold 0; context gates off)
+                </label>
+                <button type="button" className="btn btn-primary btn-sm" onClick={runDebugAnalysis} disabled={busy}>
+                  {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                  Re-analyse{debugMode ? " in debug mode" : ""}
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       <nav className="flex items-center gap-1 border-b border-line">
         {(
@@ -317,15 +420,32 @@ export default function ProjectPage() {
       {tab === "transcript" ? (
         transcript ? (
           <div className="card max-h-[65vh] overflow-y-auto p-4 scroll-thin">
-            <p className="mb-3 flex flex-wrap items-center gap-2 text-[11px] text-text-3">
-              <span className="chip">{transcript.engine || "unknown engine"}</span>
-              {transcript.model ? <span>{transcript.model}</span> : null}
+            <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px] text-text-3">
+              <span className="chip chip-good">{transcriptSourceLabel(transcript.source)}</span>
+              {transcript.filename ? <span className="font-medium text-text-2">{transcript.filename}</span> : null}
+              <span>{transcript.segment_count.toLocaleString()} segments</span>
               <span>{transcript.word_count.toLocaleString()} words</span>
               <span>{transcript.language_name}</span>
+              <span className="chip">{transcript.timing_granularity === "cue" ? "cue timing · no word timings" : "word timing"}</span>
               {transcript.language_mode && transcript.language_mode !== "monolingual" ? (
                 <span className="chip chip-warn">{transcript.language_mode}</span>
               ) : null}
-            </p>
+              {transcript.engine && transcript.source === "whisper" ? <span className="text-text-3">{transcript.engine}</span> : null}
+            </div>
+            <div className="mb-3 flex flex-wrap gap-2">
+              <button type="button" className="btn btn-secondary btn-sm" onClick={() => fileInput.current?.click()} disabled={analysing || busy}>
+                <FileText size={12} /> Replace transcript
+              </button>
+              {transcript.source.startsWith("uploaded_") || transcript.source === "source_captions" ? (
+                <button type="button" className="btn btn-ghost btn-sm" onClick={useWhisper} disabled={analysing || busy || transcript.preference === "whisper"}>
+                  <Mic size={12} /> Use Whisper instead
+                </button>
+              ) : transcript.source === "whisper" ? (
+                <button type="button" className="btn btn-ghost btn-sm" onClick={retranscribeAnyway} disabled={analysing || busy}>
+                  <RefreshCw size={12} /> Re-transcribe anyway
+                </button>
+              ) : null}
+            </div>
             <ol className="space-y-2">
               {transcript.segments.map((segment) => (
                 <li key={segment.index} className="grid grid-cols-[4.5rem_1fr] gap-3 text-[13px]">
@@ -357,6 +477,7 @@ export default function ProjectPage() {
                   <span className={`mono text-[13px] font-semibold ${scoreTone(candidate.score)}`}>{candidate.score.toFixed(0)}</span>
                   <span className="chip">{candidate.category_label || candidate.category}</span>
                   <span className={`chip ${candidate.status === "selected" ? "chip-good" : ""}`}>{candidate.status}</span>
+                  {candidate.rejection_code ? <span className="chip chip-warn">{rejectionLabel(candidate.rejection_code)}</span> : null}
                 </div>
                 <p className="mt-1 text-[13px] text-text-2">{candidate.title}</p>
                 <p className="mt-0.5 line-clamp-2 text-[11px] leading-relaxed text-text-3">{candidate.transcript_text || candidate.summary}</p>
@@ -448,6 +569,38 @@ function ClipCard({
       </div>
     </li>
   );
+}
+
+function Count({ label, value, warn = false }: { label: string; value: number | string; warn?: boolean }) {
+  return (
+    <div className="rounded border border-line bg-surface-2 px-2.5 py-2">
+      <div className={`mono text-sm font-semibold ${warn ? "text-warn" : "text-text"}`}>{value}</div>
+      <div className="mt-0.5 text-[10px] text-text-3">{label}</div>
+    </div>
+  );
+}
+
+function transcriptSourceLabel(source: string) {
+  if (source.startsWith("uploaded_")) return `Uploaded ${source.slice("uploaded_".length).toUpperCase()}`;
+  if (source === "whisper") return "Whisper";
+  if (source === "source_captions") return "Source captions";
+  return source || "Transcript not set";
+}
+
+function rejectionLabel(code: string) {
+  const labels: Record<string, string> = {
+    below_threshold: "below threshold",
+    context_dependency: "needs earlier context",
+    not_standalone: "not standalone",
+    low_confidence: "low transcript confidence",
+    overlap_duplicate: "overlaps another moment",
+    semantic_duplicate: "semantic duplicate",
+    overlap_conflict: "overlap conflict",
+    invalid_timestamp: "invalid timestamp",
+    scoring_error: "scoring error",
+    max_clips: "clip limit reached",
+  };
+  return labels[code] || code.replaceAll("_", " ");
 }
 
 function Empty({ title, body }: { title: string; body: string }) {
