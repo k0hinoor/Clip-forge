@@ -67,14 +67,16 @@ TXT = """00:00:01.000 Everyone thinks success is a straight line.
 """
 
 
-def _text_of(words: list[dict]) -> str:
-    return " ".join(word["word"] for word in words)
+def _text_of(cues: list[dict]) -> str:
+    return " ".join(cue["text"] for cue in cues)
 
 
-def _assert_monotonic(words: list[dict]) -> None:
-    for earlier, later in zip(words, words[1:]):
-        assert later["start"] >= earlier["start"] - 1e-6, "word timings must never go backwards"
-        assert later["end"] >= later["start"] - 1e-6
+def _assert_monotonic(cues: list[dict]) -> None:
+    for earlier, later in zip(cues, cues[1:]):
+        assert later["start"] >= earlier["start"] - 1e-6, "cue timings must never go backwards"
+        assert earlier["end"] > earlier["start"]
+    if cues:
+        assert cues[-1]["end"] > cues[-1]["start"]
 
 
 # --------------------------------------------------------------------------- #
@@ -82,40 +84,47 @@ def _assert_monotonic(words: list[dict]) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_srt_is_parsed_with_monotonic_word_timings(tmp_path: Path):
+def test_srt_is_parsed_as_cues_without_fabricated_word_timings(tmp_path: Path):
     from clipforge.media.download import parse_transcript_file
 
     path = tmp_path / "talk.srt"
     path.write_text(SRT, encoding="utf-8")
 
-    words = parse_transcript_file(path)
+    cues = parse_transcript_file(path)
 
-    assert len(words) >= 25, "every spoken word in the cues must become a word record"
-    assert words[0]["word"] == "Everyone"
-    assert words[0]["start"] == pytest.approx(0.5, abs=0.05)
-    assert words[0]["confidence"] == pytest.approx(0.6)
-    _assert_monotonic(words)
-    assert "straight line" in _text_of(words)
+    assert len(cues) == 3
+    assert cues[0]["start"] == pytest.approx(0.5)
+    assert cues[0]["end"] == pytest.approx(3.0)
+    assert cues[0]["text"] == "Everyone thinks success is a straight line."
+    assert all(set(cue) == {"start", "end", "text"} for cue in cues)
+    _assert_monotonic(cues)
+    assert "straight line" in _text_of(cues)
 
 
-def test_vtt_json3_and_txt_are_all_accepted(tmp_path: Path):
+def test_vtt_json3_and_txt_are_all_accepted_as_cues(tmp_path: Path):
     from clipforge.media.download import parse_transcript_file
 
     vtt = tmp_path / "track.vtt"
-    vtt.write_text(VTT, encoding="utf-8")
+    vtt.write_text(
+        VTT.replace("00:00:01.000 --> 00:00:02.500", "00:00:01.000 --> 00:00:02.500 align:start position:0%"),
+        encoding="utf-8",
+    )
     json3 = tmp_path / "captions.json3"
     json3.write_text(json.dumps(JSON3), encoding="utf-8")
     txt = tmp_path / "notes.txt"
     txt.write_text(TXT, encoding="utf-8")
 
     for path in (vtt, json3, txt):
-        words = parse_transcript_file(path)
-        assert words, f"{path.name} produced no words"
-        assert _text_of(words)
-        _assert_monotonic(words)
+        cues = parse_transcript_file(path)
+        assert cues, f"{path.name} produced no cues"
+        assert _text_of(cues)
+        assert all(set(cue) == {"start", "end", "text"} for cue in cues)
+        _assert_monotonic(cues)
 
-    assert [word["start"] for word in parse_transcript_file(json3)][:2] == pytest.approx([1.0, 1.0]) or True
+    assert parse_transcript_file(vtt)[0]["start"] == pytest.approx(1.0, abs=0.01)
     assert parse_transcript_file(json3)[0]["start"] == pytest.approx(1.0, abs=0.01)
+    assert parse_transcript_file(json3)[0]["end"] == pytest.approx(5.0, abs=0.01)
+    assert parse_transcript_file(json3)[0]["text"] == "The founder kept shipping."
 
 
 def test_transcript_files_prefers_a_parsable_file(tmp_path: Path):
@@ -168,7 +177,7 @@ def test_pipeline_skips_unparsable_transcript_files(tmp_path: Path, settings):
 
     assert transcript is not None, "the good transcript must still be used"
     assert transcript.model == "talk.srt"
-    assert transcript.engine == "transcript-file"
+    assert transcript.engine == "uploaded transcript"
     assert transcript.utterances
 
 

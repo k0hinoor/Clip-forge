@@ -130,7 +130,7 @@ def test_transcript_file_discovery_prefers_json3(tmp_path):
     assert [path.suffix for path in found][0] == ".json3"
 
 
-def test_json3_caption_parser_handles_word_level_events(tmp_path):
+def test_json3_caption_parser_preserves_cue_level_timings(tmp_path):
     from clipforge.media.download import parse_json3_captions
 
     payload = {
@@ -141,10 +141,11 @@ def test_json3_caption_parser_handles_word_level_events(tmp_path):
     }
     path = tmp_path / "captions.json3"
     path.write_text(json.dumps(payload))
-    words = parse_json3_captions(path)
-    assert [word["word"] for word in words] == ["Hello", "world", "again"]
-    assert words[0]["start"] == pytest.approx(1.0, abs=0.05)
-    assert words[-1]["start"] == pytest.approx(3.2, abs=0.05)
+    cues = parse_json3_captions(path)
+    assert [cue["text"] for cue in cues] == ["Hello world", "again"]
+    assert [cue["start"] for cue in cues] == pytest.approx([1.0, 3.2])
+    assert [cue["end"] for cue in cues] == pytest.approx([3.0, 4.7])
+    assert all(set(cue) == {"start", "end", "text"} for cue in cues)
 
 
 # --------------------------------------------------------------------------- #
