@@ -213,6 +213,7 @@ class AppSettings(BaseModel):
     min_clip_seconds: float = 35.0
     max_clip_seconds: float = 75.0
     min_score: float = 70.0
+    debug_mode: bool = False  # retain valid candidates for diagnosis; threshold/context gates disabled
     max_clips: int = 0  # 0 = unlimited
     aspect_ratio: AspectRatio = "9:16"
     output_width: int = 1080

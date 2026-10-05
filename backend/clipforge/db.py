@@ -103,6 +103,10 @@ class Project(Base):
     segment_count: Mapped[int] = mapped_column(Integer, default=0)
     candidate_count: Mapped[int] = mapped_column(Integer, default=0)
     clip_count: Mapped[int] = mapped_column(Integer, default=0)
+    transcript_source: Mapped[str] = mapped_column(String(40), default="")
+    transcript_preference: Mapped[str] = mapped_column(String(40), default="")
+    transcript_filename: Mapped[str] = mapped_column(String(260), default="")
+    transcript_timing: Mapped[str] = mapped_column(String(20), default="")  # word | cue
 
     settings_json: Mapped[str] = mapped_column(Text, default="{}")   # analysis options for this project
     media_json: Mapped[str] = mapped_column(Text, default="{}")      # ffprobe summary
@@ -170,6 +174,10 @@ class Project(Base):
             "segment_count": self.segment_count,
             "candidate_count": self.candidate_count,
             "clip_count": self.clip_count,
+            "transcript_source": self.transcript_source,
+            "transcript_preference": self.transcript_preference,
+            "transcript_filename": self.transcript_filename,
+            "transcript_timing": self.transcript_timing,
             "settings": self.settings,
             "media": self.media,
             "paths": self.paths,
@@ -221,7 +229,8 @@ class TranscriptSegment(Base):
             "speaker": self.speaker,
             "language": self.language,
             "confidence": round(self.confidence, 3),
-            "word_count": len(self.words),
+            "word_count": len(self.words) or len(self.text.split()),
+            "has_word_timings": bool(self.words),
         }
         if with_words:
             payload["words"] = self.words
@@ -250,6 +259,7 @@ class Candidate(Base):
     summary: Mapped[str] = mapped_column(Text, default="")
     category: Mapped[str] = mapped_column(String(60), default="other")
     reason: Mapped[str] = mapped_column(Text, default="")
+    rejection_code: Mapped[str] = mapped_column(String(40), default="")
     score: Mapped[float] = mapped_column(Float, default=0.0)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     factors_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -281,7 +291,10 @@ class Candidate(Base):
             "hook": self.hook,
             "summary": self.summary,
             "category": self.category,
+            "category_label": _category_label(self.category),
             "reason": self.reason,
+            "rejection_code": self.rejection_code,
+            "transcript_text": self.transcript_text,
             "score": round(self.score, 1),
             "confidence": round(self.confidence, 3),
             "factors": load(self.factors_json, {}),
@@ -629,7 +642,12 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "candidate_count": "INTEGER DEFAULT 0",
         "language_mode": "TEXT DEFAULT ''",
         "language_secondary": "TEXT DEFAULT ''",
+        "transcript_source": "TEXT DEFAULT ''",
+        "transcript_preference": "TEXT DEFAULT ''",
+        "transcript_filename": "TEXT DEFAULT ''",
+        "transcript_timing": "TEXT DEFAULT ''",
     },
+    "candidates": {"rejection_code": "TEXT DEFAULT ''"},
     "clips": {"timeline_json": "TEXT DEFAULT '{}'", "preview_path": "TEXT DEFAULT ''"},
     "jobs": {"worker": "TEXT DEFAULT ''"},
 }

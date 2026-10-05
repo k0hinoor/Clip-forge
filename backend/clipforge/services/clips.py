@@ -63,6 +63,8 @@ def load_project_sentences(project_id: str) -> list[Sentence]:
             .scalars()
             .all()
         )
+        project = session.get(Project, project_id)
+        preserve_cues = bool(project and project.transcript_timing == "cue")
         utterances = [
             Utterance(
                 text=row.text,
@@ -84,7 +86,7 @@ def load_project_sentences(project_id: str) -> list[Sentence]:
             )
             for row in rows
         ]
-    return build_sentences(utterances)
+    return build_sentences(utterances, preserve_cue_boundaries=preserve_cues)
 
 
 def _stored_layout(clip_id: str) -> dict[str, Any]:
@@ -313,12 +315,14 @@ def _retime_clip(clip_id: str, project_id: str, new_start: float | None, new_end
             hint="Raise the maximum clip length in Settings -> Clips first.",
             status_code=422,
         )
-    words = words_in_range(load_project_sentences(project_id), start, end)
-    if not words:
+    project_sentences = load_project_sentences(project_id)
+    words = words_in_range(project_sentences, start, end)
+    selected_sentences = [sentence for sentence in project_sentences if sentence.end >= start and sentence.start <= end]
+    if not words and not selected_sentences:
         raise ClipForgeError(
             code=ErrorCode.INVALID_INPUT,
-            message="No speech was found in that range.",
-            hint="Pick a range that contains spoken words.",
+            message="No transcript text was found in that range.",
+            hint="Pick a range that overlaps a transcript cue or spoken words.",
             status_code=422,
         )
     timeline = plan_timeline(source, start, end, settings)
@@ -331,6 +335,14 @@ def _retime_clip(clip_id: str, project_id: str, new_start: float | None, new_end
         clip.start, clip.end = start, end
         clip.duration = round(timeline.output_duration, 3)
         clip.words_json = json.dumps([word.to_dict() for word in words])
+        clip.segments_json = json.dumps(
+            {
+                "sentences": [sentence.to_dict() for sentence in selected_sentences],
+                "sentence_start": selected_sentences[0].index if selected_sentences else 0,
+                "sentence_end": selected_sentences[-1].index + 1 if selected_sentences else 0,
+            },
+            ensure_ascii=False,
+        )
         clip.trim_json = json.dumps(timeline.to_dict())
 
 
@@ -492,6 +504,7 @@ def regenerate_clip(clip_id: str, *, window: float = 120.0, use_llm: bool = True
     absolute_start = best.start
     absolute_end = best.end
     words = words_in_range(sentences, absolute_start, absolute_end)
+    selected_sentences = [sentence for sentence in sentences if sentence.end >= absolute_start and sentence.start <= absolute_end]
 
     enrichment: dict[str, Any] = {}
     if use_llm and settings.llm_enabled and not llm_note:
@@ -522,6 +535,9 @@ def regenerate_clip(clip_id: str, *, window: float = 120.0, use_llm: bool = True
         clip.why_json = json.dumps(enrichment.get("why") or best.why or clip.why)
         clip.factors_json = json.dumps(best.features.factors)
         clip.words_json = json.dumps([word.to_dict() for word in words])
+        clip.segments_json = json.dumps(
+            {"sentences": [sentence.to_dict() for sentence in selected_sentences]}, ensure_ascii=False
+        )
         clip.trim_json = json.dumps(timeline.to_dict())
         clip.duration = round(timeline.output_duration, 3)
         clip.status = "pending"
@@ -573,6 +589,7 @@ def caption_preview(clip_id: str = "", *, preset: str | None = None, theme: dict
             hint="Choose one of: " + ", ".join(sorted(CAPTION_PRESETS)),
             status_code=422,
         )
+    cues: list[dict[str, Any]] = []
     if clip_id:
         with session_scope() as session:
             clip = session.get(Clip, clip_id)
@@ -596,6 +613,15 @@ def caption_preview(clip_id: str = "", *, preset: str | None = None, theme: dict
                 for word in words:
                     word.start, word.end = word.start - offset, word.end - offset
             language = project.language if project else "en"
+            if not words:
+                try:
+                    stored_segments = json.loads(clip.segments_json or "{}")
+                except json.JSONDecodeError:
+                    stored_segments = {}
+                cue_rows = stored_segments.get("sentences", []) if isinstance(stored_segments, dict) else []
+                from ..pipeline.edit import _remap_cues
+
+                cues = _remap_cues(cue_rows, load_timeline(clip, settings))
     else:
         settings = get_settings()
         words = _sample_words()
@@ -616,7 +642,7 @@ def caption_preview(clip_id: str = "", *, preset: str | None = None, theme: dict
             base = CaptionTheme.model_validate(merged)
         except ValueError as exc:
             raise ClipForgeError(code=ErrorCode.INVALID_INPUT, message=f"Invalid caption theme: {exc}", status_code=422) from exc
-    plan = plan_captions(words, theme=base, language=language or "en")
+    plan = plan_captions(words, theme=base, language=language or "en", cues=cues if cues else None)
     return {**plan.to_dict(), "theme": base.model_dump(), "captions_enabled": settings.captions_enabled}
 
 
@@ -641,6 +667,7 @@ def write_clip_srt(clip_id: str) -> Path:
             start=line["start"],
             end=line["end"],
             index=line["index"],
+            text_override="" if line.get("has_word_timings", True) else line.get("text", ""),
         )
         for line in preview["lines"]
     ]

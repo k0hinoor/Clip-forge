@@ -301,7 +301,7 @@ class TranscriptIndex:
 
         confidences = [word.confidence for sentence in sentences for word in sentence.words if word.confidence]
         gaps = [max(0.0, sentences[i + 1].start - sentences[i].end) for i in range(len(sentences) - 1)]
-        word_count = sum(len(sentence.words) for sentence in sentences)
+        word_count = sum(len(sentence.words) or len(words_only(sentence.text)) for sentence in sentences)
         # prefix_token_counts[i] = tokens in sentences[0..i-1] (cumulative, inclusive prefix).
         prefix_token_counts = [0]
         for sentence in sentences:
@@ -393,7 +393,8 @@ def aggregate(index: TranscriptIndex, start_index: int, end_index: int) -> Range
     for position in range(start_index, end_index):
         stat = index.stats[position]
         token_count += stat.token_count
-        words += len(index.sentences[position].words)
+        sentence = index.sentences[position]
+        words += len(sentence.words) or len(words_only(sentence.text))
         numbers += stat.numbers
         questions += stat.questions
         exclamations += stat.exclamations

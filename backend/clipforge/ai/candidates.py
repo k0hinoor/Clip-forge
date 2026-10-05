@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from ..constants import CATEGORIES, coerce_category
 from ..logging_setup import get_logger
@@ -59,6 +59,7 @@ class Candidate:
     context_before: str = ""
     context_after: str = ""
     status: str = "candidate"
+    rejection_code: str = ""
     duplicate_of: str = ""
     llm_note: str = ""
 
@@ -85,6 +86,7 @@ class Candidate:
             "confidence": round(self.confidence, 3),
             "source": self.source,
             "status": self.status,
+            "rejection_code": self.rejection_code,
             "duplicate_of": self.duplicate_of,
             "features": self.features.to_dict(),
             "meta": self.features.meta,
@@ -106,6 +108,7 @@ def generate_candidates(
     llm_seeds: Sequence[dict[str, Any]] | None = None,
     progress=None,
     should_cancel=None,
+    on_error: Callable[[int, int, Exception], None] | None = None,
 ) -> list[Candidate]:
     """Discover every plausible short-form moment in the transcript."""
     sentences = index.sentences
@@ -124,15 +127,24 @@ def generate_candidates(
             break
         scored: list[tuple[float, int, CandidateFeatures]] = []
         for end_index in end_options:
-            features = compute_features(
-                index,
-                start_index,
-                end_index,
-                target_seconds=target_seconds,
-                min_seconds=min_seconds,
-                max_seconds=max_seconds,
-            )
             evaluations += 1
+            try:
+                features = compute_features(
+                    index,
+                    start_index,
+                    end_index,
+                    target_seconds=target_seconds,
+                    min_seconds=min_seconds,
+                    max_seconds=max_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 - record this window, do not invent a zero score
+                log.exception("candidate scoring failed for sentence range %d:%d", start_index, end_index)
+                if on_error is not None:
+                    try:
+                        on_error(start_index, end_index, exc)
+                    except Exception:  # noqa: BLE001 - diagnostics must not break discovery
+                        log.exception("candidate scoring error reporter failed")
+                continue
             scored.append((features.weighted_score, end_index, features))
         if not scored:
             continue
@@ -376,6 +388,8 @@ def merge_llm_seeds(
     min_seconds: float,
     max_seconds: float,
     target_seconds: float,
+    *,
+    on_error: Any = None,
 ) -> list[Candidate]:
     """Blend model-suggested moments with the analytical candidate pool."""
     by_range = {candidate.key(): candidate for candidate in candidates}
@@ -393,13 +407,24 @@ def merge_llm_seeds(
         if duration < min_seconds * 0.8 or duration > max_seconds * 1.3:
             continue
 
-        features = compute_features(
-            index, start_index, end_index,
-            target_seconds=target_seconds, min_seconds=min_seconds, max_seconds=max_seconds,
-        )
-        llm_score = _as_float(seed.get("score")) or 0.0
-        if llm_score > 1.0:
-            llm_score /= 100.0
+        try:
+            features = compute_features(
+                index, start_index, end_index,
+                target_seconds=target_seconds, min_seconds=min_seconds, max_seconds=max_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad model range must not kill the candidate pool
+            if on_error is not None:
+                on_error("scoring_error", f"Could not score LLM moment {start:.3f}-{end:.3f}s: {exc}")
+            log.exception("could not score LLM moment %.3f-%.3f", start, end)
+            continue
+        raw_score = _as_float(seed.get("score"))
+        if raw_score is None or raw_score < 0 or raw_score > 100:
+            if on_error is not None:
+                on_error("invalid_llm_score", f"LLM moment at {start:.3f}s has invalid score {seed.get('score')!r}")
+            log.warning("skipping LLM moment with invalid score: %r", seed.get("score"))
+            continue
+        normalized_score = raw_score * 100.0 if raw_score <= 1.0 else raw_score
+        llm_score = normalized_score / 100.0
         blended = 0.55 * features.weighted_score + 0.45 * llm_score
 
         key = f"{start_index}:{end_index}"

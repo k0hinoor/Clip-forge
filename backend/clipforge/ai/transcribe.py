@@ -81,6 +81,9 @@ class Transcript:
     warnings: list[str] = field(default_factory=list)
     translated: bool = False
     source_language: str = ""
+    source: str = "whisper"
+    filename: str = ""
+    timing_granularity: str = "word"  # word for ASR/alignment; cue for subtitle sources
 
     @property
     def words(self) -> list[Word]:
@@ -95,7 +98,11 @@ class Transcript:
 
     @property
     def word_count(self) -> int:
-        return sum(len(utterance.words) for utterance in self.utterances)
+        timed_words = sum(len(utterance.words) for utterance in self.utterances)
+        if timed_words:
+            return timed_words
+        # Subtitle-only input has text words but intentionally no per-word timings.
+        return sum(len((utterance.text or "").split()) for utterance in self.utterances)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Transcript":
@@ -120,11 +127,21 @@ class Transcript:
             )
             for item in payload.get("utterances") or []
         ]
+        engine = str(payload.get("engine", ""))
+        if "source" in payload:
+            source = str(payload.get("source") or "whisper")
+        elif "caption" in engine.lower():
+            source = "source_captions"
+        elif "transcript-file" in engine.lower():
+            source = "uploaded_legacy"
+        else:
+            source = "whisper"
+        timing_granularity = str(payload.get("timing_granularity") or ("word" if any(item.words for item in utterances) else "cue"))
         return cls(
             language=str(payload.get("language", "en")),
             language_confidence=float(payload.get("language_confidence", 0.0)),
             utterances=utterances,
-            engine=str(payload.get("engine", "")),
+            engine=engine,
             model=str(payload.get("model", "")),
             duration=float(payload.get("duration", 0.0)),
             language_probabilities=dict(payload.get("language_probabilities") or {}),
@@ -133,6 +150,9 @@ class Transcript:
             warnings=list(payload.get("warnings") or []),
             translated=bool(payload.get("translated", False)),
             source_language=str(payload.get("source_language", "")),
+            source=source,
+            filename=str(payload.get("filename", "")),
+            timing_granularity=timing_granularity,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -149,6 +169,9 @@ class Transcript:
             "warnings": self.warnings,
             "translated": self.translated,
             "source_language": self.source_language,
+            "source": self.source,
+            "filename": self.filename,
+            "timing_granularity": self.timing_granularity,
             "utterances": [
                 {
                     "text": utterance.text,

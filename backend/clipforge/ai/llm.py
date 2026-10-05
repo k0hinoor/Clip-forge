@@ -189,11 +189,12 @@ class OllamaClient:
                 text = self._generate(prompt, system=system, json_mode=True)
             except ClipForgeError:
                 raise
+            log.debug("ollama raw response (%d chars): %s", len(text), text[:3000])
             parsed = parse_json_block(text)
             if parsed is not None:
                 return parsed
             last_error = text[:500]
-            log.warning("ollama returned non-JSON output (attempt %d)", attempt + 1)
+            log.warning("ollama returned non-JSON output (attempt %d); raw excerpt: %r", attempt + 1, text[:1000])
             prompt = prompt + "\n\nReturn valid JSON only. No prose, no markdown."
         raise ClipForgeError(
             code=ErrorCode.OLLAMA_ERROR,
@@ -415,6 +416,7 @@ def discover_moments(
     settings: AppSettings | None = None,
     progress: Callable[[float, str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    diagnostics: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Ask the model to point at candidate moments, chunk by chunk (in parallel)."""
     settings = settings or get_settings()
@@ -426,6 +428,12 @@ def discover_moments(
     log.info("LLM discovery over %d transcript chunks with %s", len(chunks), settings.ollama_model)
     results: list[dict[str, Any]] = []
     completed = 0
+    diagnostic_counts = {"chunks_failed": 0, "invalid_payloads": 0, "invalid_moments": 0, "invalid_scores": 0}
+    diagnostic_lock = threading.Lock()
+
+    def count(name: str) -> None:
+        with diagnostic_lock:
+            diagnostic_counts[name] += 1
 
     def work(chunk: TranscriptChunk) -> list[dict[str, Any]]:
         prompt = DISCOVERY_PROMPT.format(
@@ -440,22 +448,43 @@ def discover_moments(
         try:
             payload = client.generate_json(prompt)
         except ClipForgeError as exc:
-            log.warning("chunk %d failed: %s", chunk.index, exc.message)
+            count("chunks_failed")
+            log.warning("LLM chunk %d failed: %s", chunk.index, exc.message)
             return []
         moments = payload.get("moments") if isinstance(payload, dict) else payload
         if not isinstance(moments, list):
+            count("invalid_payloads")
+            log.warning("LLM chunk %d returned the wrong JSON shape: %r", chunk.index, payload)
             return []
         out: list[dict[str, Any]] = []
-        for moment in moments:
+        for moment_index, moment in enumerate(moments):
             if not isinstance(moment, dict):
+                count("invalid_moments")
+                log.warning("LLM chunk %d moment %d is not an object: %r", chunk.index, moment_index, moment)
                 continue
             start = parse_timestamp(moment.get("start"))
             end = parse_timestamp(moment.get("end"))
-            if start is None or end is None or end <= start:
+            if (
+                start is None or end is None or start < 0 or end <= start
+                or end - start < 15 or end - start > 180
+                or (duration > 0 and (start >= duration or end > duration + 1.0))
+            ):
+                count("invalid_moments")
+                log.warning("LLM chunk %d emitted invalid timestamps: %r", chunk.index, moment)
                 continue
-            if end - start < 15 or end - start > 180:  # keep obviously broken ranges out
+            raw_score = moment.get("score")
+            try:
+                numeric_score = float(raw_score)
+            except (TypeError, ValueError):
+                numeric_score = -1.0
+            if numeric_score < 0 or numeric_score > 100:
+                count("invalid_scores")
+                log.warning("LLM chunk %d emitted invalid score %r: %r", chunk.index, raw_score, moment)
                 continue
-            out.append({**moment, "start": start, "end": end, "chunk": chunk.index})
+            # The public convention is 0-100; models often return 0.87 as a
+            # normalized confidence. Convert it once, before merging.
+            normalized_score = numeric_score * 100.0 if numeric_score <= 1.0 else numeric_score
+            out.append({**moment, "start": start, "end": end, "score": normalized_score, "chunk": chunk.index})
         return out
 
     workers = max(1, min(settings.llm_max_workers, len(chunks)))
@@ -474,7 +503,11 @@ def discover_moments(
             if progress:
                 progress(completed / len(chunks), f"model analysed {completed}/{len(chunks)} transcript chunks")
 
-    log.info("LLM proposed %d raw moments", len(results))
+    log.info("LLM proposed %d validated moments; diagnostics=%s", len(results), diagnostic_counts)
+    if diagnostics is not None:
+        diagnostics.update(diagnostic_counts)
+        diagnostics["chunks"] = len(chunks)
+        diagnostics["validated_moments"] = len(results)
     return results
 
 

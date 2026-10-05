@@ -64,7 +64,8 @@ class Sentence:
 
     @property
     def word_count(self) -> int:
-        return len(self.words)
+        # Counts text tokens for cue transcripts; this does not imply word timings.
+        return len(self.words) or len(words_only(self.text))
 
     @property
     def wpm(self) -> float:
@@ -138,11 +139,32 @@ class SegmentationResult:
 # --------------------------------------------------------------------------- #
 
 
-def build_sentences(utterances: Sequence[Utterance]) -> list[Sentence]:
-    sentences: list[Sentence] = []
-    for utterance in utterances:
-        sentences.extend(_sentences_from_utterance(utterance))
-    sentences = _merge_fragments(sentences)
+def build_sentences(utterances: Sequence[Utterance], *, preserve_cue_boundaries: bool = False) -> list[Sentence]:
+    """Build analysis sentences, optionally retaining uploaded subtitle cues verbatim.
+
+    Subtitle-only sources have cue-level timestamps, not word timings. In that
+    mode each cue is one sentence and its text/start/end are not split, merged,
+    or sentence-cased.
+    """
+    if preserve_cue_boundaries:
+        sentences = [
+            Sentence(
+                index=index,
+                start=utterance.start,
+                end=utterance.end,
+                text=utterance.text,
+                speaker=utterance.speaker,
+                words=list(utterance.words),
+                confidence=utterance.confidence,
+            )
+            for index, utterance in enumerate(utterances)
+            if utterance.text.strip() and utterance.end > utterance.start
+        ]
+    else:
+        sentences = []
+        for utterance in utterances:
+            sentences.extend(_sentences_from_utterance(utterance))
+        sentences = _merge_fragments(sentences)
     for index, sentence in enumerate(sentences):
         sentence.index = index
         sentence.features = _sentence_features(sentence)

@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 
-from ..ai.language import language_name
+from ..ai.language import detect_language, language_name
 from ..config import AppSettings, merge_settings_patch
 from ..constants import STAGES, stage_public_list
 from ..db import Candidate, Clip, Job, Project, TranscriptSegment, session_scope, slugify
@@ -217,11 +217,23 @@ def project_status(project_id: str) -> dict[str, Any]:
             .first()
         )
         clip_rows = session.execute(select(Clip).where(Clip.project_id == project_id)).scalars().all()
+        candidate_rows = session.execute(select(Candidate).where(Candidate.project_id == project_id)).scalars().all()
         payload = project.to_dict()
         job_payload = job.to_dict() if job else None
 
     stage_states = _stage_states(payload, job_payload)
+    analysis_stats = (payload.get("stats") or {}).get("analysis", {})
+    diagnostics = analysis_stats.get("diagnostics", {}) if isinstance(analysis_stats, dict) else {}
+    candidate_statuses: dict[str, int] = {}
+    for candidate in candidate_rows:
+        candidate_statuses[candidate.status] = candidate_statuses.get(candidate.status, 0) + 1
     rendered = sum(1 for clip in clip_rows if clip.status == "rendered")
+    diagnostics = {
+        **(diagnostics if isinstance(diagnostics, dict) else {}),
+        "queued": sum(1 for clip in clip_rows if clip.status == "queued"),
+        "rendered": rendered,
+        "rendering": sum(1 for clip in clip_rows if clip.status == "rendering"),
+    }
     has_source = find_media(ProjectPaths.for_snapshot(payload).source) is not None
     return {
         "project": {
@@ -232,6 +244,11 @@ def project_status(project_id: str) -> dict[str, Any]:
             "source_url": payload["source_url"],
             "has_source": has_source,
             "word_count": payload["word_count"],
+            "segment_count": payload["segment_count"],
+            "transcript_source": payload["transcript_source"],
+            "transcript_preference": payload["transcript_preference"],
+            "transcript_filename": payload["transcript_filename"],
+            "transcript_timing": payload["transcript_timing"],
             "status": payload["status"],
             "stage": payload["stage"],
             "progress": payload["progress"],
@@ -250,6 +267,24 @@ def project_status(project_id: str) -> dict[str, Any]:
         },
         "job": job_payload,
         "stages": stage_states,
+        "candidates": {
+            "discovered": int(diagnostics.get("discovered", payload["candidate_count"]) or 0),
+            "stored": len(candidate_rows),
+            "scored": int(diagnostics.get("scored", 0) or 0),
+            "scoring_errors": int(diagnostics.get("scoring_errors", 0) or 0),
+            "threshold_pass": int(diagnostics.get("threshold_pass", 0) or 0),
+            "context_rejections": int(diagnostics.get("context_rejections", 0) or 0),
+            "overlap_rejections": int(diagnostics.get("overlap_rejections", 0) or 0),
+            "final_accepted": int(diagnostics.get("final_accepted", payload["clip_count"]) or 0),
+            "average_score": float(diagnostics.get("average_score", 0.0) or 0.0),
+            "highest_score": float(diagnostics.get("highest_score", 0.0) or 0.0),
+            "threshold": float(diagnostics.get("threshold", 0.0) or 0.0),
+            "queued": int(diagnostics.get("queued", 0) or 0),
+            "rendered": int(diagnostics.get("rendered", 0) or 0),
+            "top_rejection_reason": diagnostics.get("top_rejection_reason", ""),
+            "statuses": candidate_statuses,
+        },
+        "diagnostics": diagnostics,
         "clips": {
             "total": len(clip_rows),
             "rendered": rendered,
@@ -322,12 +357,115 @@ def project_transcript(
         "language_secondary": payload["language_secondary"],
         "engine": (payload.get("stats", {}).get("transcript") or {}).get("engine", ""),
         "model": (payload.get("stats", {}).get("transcript") or {}).get("model", ""),
+        "source": payload["transcript_source"],
+        "preference": payload["transcript_preference"],
+        "filename": payload["transcript_filename"],
+        "timing_granularity": payload["transcript_timing"],
         "word_count": payload["word_count"],
         "segment_count": payload["segment_count"],
         "speakers": payload["speakers"],
         "segments": segments,
         "count": len(segments),
     }
+
+
+def attach_transcript(project_id: str, *, filename: str, suffix: str, cues: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist an uploaded cue transcript and invalidate only transcript-derived data.
+
+    Source metadata, the downloaded/uploaded video, and extracted audio remain
+    intact so replacing captions does not cause another download or extraction.
+    """
+    if not cues:
+        raise ValueError("attach_transcript requires at least one parsed cue")
+    text = " ".join(str(cue.get("text") or "") for cue in cues)
+    language = detect_language(text)
+    source = f"uploaded_{suffix.lstrip('.').lower()}"
+    word_count = sum(len(str(cue.get("text") or "").split()) for cue in cues)
+
+    with session_scope() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise not_found("Project", project_id)
+        session.query(TranscriptSegment).filter(TranscriptSegment.project_id == project_id).delete()
+        session.query(Candidate).filter(Candidate.project_id == project_id).delete()
+        session.query(Clip).filter(Clip.project_id == project_id).delete()
+        for index, cue in enumerate(cues):
+            session.add(
+                TranscriptSegment(
+                    project_id=project_id,
+                    idx=index,
+                    start=float(cue["start"]),
+                    end=float(cue["end"]),
+                    text=str(cue["text"]),
+                    speaker="SPEAKER_01",
+                    language=language.primary,
+                    confidence=1.0,
+                    words_json="[]",
+                )
+            )
+        project.transcript_source = source
+        project.transcript_preference = source
+        project.transcript_filename = filename[:260]
+        project.transcript_timing = "cue"
+        project.segment_count = len(cues)
+        project.word_count = word_count
+        project.language = language.primary
+        project.language_secondary = language.secondary
+        project.language_mode = language.mode
+        project.language_confidence = language.confidence
+        project.candidate_count = 0
+        project.clip_count = 0
+        project.status = "draft"
+        project.stage = "transcript"
+        project.progress = 0.0
+        project.status_message = f"{len(cues)} transcript cues ready; run analysis"
+        project.error_code = ""
+        project.error_message = ""
+        project.error_hint = ""
+        project.analyzed_at = None
+        try:
+            stats = json.loads(project.stats_json or "{}")
+        except (TypeError, ValueError):
+            stats = {}
+        stats.pop("analysis", None)
+        stats["transcript"] = {
+            "engine": "uploaded transcript",
+            "model": filename,
+            "source": source,
+            "filename": filename,
+            "language": language.primary,
+            "timing_granularity": "cue",
+            "word_timing_count": 0,
+            "segment_count": len(cues),
+        }
+        stats.pop("speakers", None)
+        project.stats_json = json.dumps(stats)
+        snapshot = project.to_dict()
+
+    paths = ProjectPaths.for_snapshot(snapshot)
+    for name in ("asr_cache.json", "transcript.json", "words.jsonl", "engine.json", "language.json"):
+        target = paths.transcript / name
+        if name == "language.json":
+            target = paths.analysis / name
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not invalidate transcript cache %s: %s", target, exc)
+    if paths.analysis.exists():
+        for target in paths.analysis.glob("*.json"):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not invalidate transcript analysis %s: %s", target, exc)
+
+    updated = project_detail(project_id)
+    events.publish("project.updated", {"project": updated}, project_id=project_id)
+    events.publish(
+        "transcript.updated",
+        {"project_id": project_id, "source": source, "filename": filename, "segment_count": len(cues)},
+        project_id=project_id,
+    )
+    return updated
 
 
 def project_candidates(project_id: str, *, status: str = "", limit: int = 300) -> dict[str, Any]:

@@ -598,59 +598,8 @@ def download_captions(url: str, destination: Path, *, languages: tuple[str, ...]
 
 
 def parse_json3_captions(path: Path) -> list[dict[str, Any]]:
-    """Convert a YouTube ``json3`` caption file into word records."""
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-
-    words: list[dict[str, Any]] = []
-    for event in payload.get("events") or []:
-        base_ms = event.get("tStartMs") or 0
-        duration = event.get("dDurationMs") or 0
-        segments = event.get("segs") or []
-        if not segments:
-            continue
-        plain = "".join(seg.get("utf8", "") for seg in segments).strip()
-        if not plain:
-            continue
-        confidences = [seg.get("acAsrConf") for seg in segments if isinstance(seg.get("acAsrConf"), (int, float))]
-        confidence = (sum(confidences) / len(confidences)) if confidences else 0.7
-
-        # Auto captions are word-level; manual captions carry whole lines.
-        if len(segments) > 1:
-            for seg in segments:
-                text = (seg.get("utf8") or "").strip()
-                if not text:
-                    continue
-                start = (base_ms + (seg.get("tOffsetMs") or 0)) / 1000
-                words.append(
-                    {
-                        "word": text,
-                        "start": round(start, 3),
-                        "end": round(start + 0.4, 3),
-                        "confidence": round(float(confidence), 3),
-                    }
-                )
-        else:
-            start = base_ms / 1000
-            end = (base_ms + duration) / 1000 if duration else start + 1.5
-            tokens = plain.split()
-            span = max(end - start, 0.2) / max(len(tokens), 1)
-            for index, token in enumerate(tokens):
-                words.append(
-                    {
-                        "word": token,
-                        "start": round(start + index * span, 3),
-                        "end": round(start + (index + 1) * span, 3),
-                        "confidence": round(float(confidence), 3),
-                    }
-                )
-    # Fix overlapping timings produced by coarse caption tracks.
-    for index in range(len(words) - 1):
-        if words[index]["end"] > words[index + 1]["start"]:
-            words[index]["end"] = max(words[index]["start"] + 0.05, words[index + 1]["start"])
-    return words
+    """Compatibility name for normalized cue parsing of YouTube json3 files."""
+    return _parse_json3_segments(Path(path))
 
 
 # --------------------------------------------------------------------------- #
@@ -659,125 +608,170 @@ def parse_json3_captions(path: Path) -> list[dict[str, Any]]:
 
 TRANSCRIPT_EXTENSIONS = (".srt", ".vtt", ".json3", ".txt")
 
-_SRT_TIME_RE = re.compile(
-    r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})"
-)
+# SRT permits comma milliseconds; WebVTT uses dots. Hours are optional in VTT.
+_TIME_PATTERN = r"(?:\d{1,}:)?\d{1,2}:\d{2}(?:[,.]\d{1,3})?"
+_SRT_TIME_RE = re.compile(rf"(?P<start>{_TIME_PATTERN})[ \t]*-->[ \t]*(?P<end>{_TIME_PATTERN})(?:[ \t]+[^\r\n]*)?")
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _clock_to_seconds(value: str) -> float:
-    value = value.strip().replace(",", ".")
-    parts = value.split(":")
-    try:
-        numbers = [float(part) for part in parts]
-    except ValueError:
+    """Convert SRT/VTT timestamps without rounding their millisecond precision."""
+    match = re.fullmatch(
+        r"(?:(?P<hours>\d+):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{2})(?:[,.](?P<millis>\d{1,3}))?",
+        value.strip(),
+    )
+    if not match:
         return 0.0
-    while len(numbers) < 3:
-        numbers.insert(0, 0.0)
-    hours, minutes, seconds = numbers[-3], numbers[-2], numbers[-1]
-    return hours * 3600 + minutes * 60 + seconds
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes"))
+    seconds = int(match.group("seconds"))
+    milliseconds = int((match.group("millis") or "0").ljust(3, "0"))
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
 
 
-def _words_from_cue(text: str, start: float, end: float, confidence: float = 0.6) -> list[dict[str, Any]]:
-    """Split one subtitle cue into word records with proportional timings.
+def _clean_subtitle_text(text: str) -> str:
+    """Remove subtitle markup while leaving the speaker's words/casing intact."""
+    import html
 
-    Subtitle cues only carry line-level timings, so per-word times are estimated
-    by character length inside the cue. That estimate is clearly reported back to
-    the UI (``word timings estimated from subtitle cues``) and is good enough for
-    caption display, while real ASR remains the accurate path.
-    """
-    tokens = [token for token in _TAG_RE.sub(" ", text).split() if token]
-    if not tokens:
-        return []
-    total_chars = sum(len(token) for token in tokens) or 1
-    span = max(end - start, 0.08)
-    words: list[dict[str, Any]] = []
-    cursor = start
-    for token in tokens:
-        share = span * (len(token) / total_chars)
-        words.append(
-            {
-                "word": token,
-                "start": round(cursor, 3),
-                "end": round(min(cursor + share, end), 3),
-                "confidence": round(confidence, 3),
-            }
-        )
-        cursor += share
-    return words
+    without_tags = _TAG_RE.sub("", text)
+    return " ".join(html.unescape(without_tags).replace("\ufeff", "").split())
 
 
-def parse_subtitle_captions(path: str | Path) -> list[dict[str, Any]]:
-    """Parse an SRT or WebVTT file into word records (line timings → words)."""
+def _valid_cue(start: float, end: float, text: str) -> dict[str, Any] | None:
+    text = _clean_subtitle_text(text)
+    if not text or start < 0 or end <= start:
+        return None
+    return {"start": float(start), "end": float(end), "text": text}
+
+
+def _parse_subtitle_segments(path: Path) -> list[dict[str, Any]]:
     try:
-        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return []
+    matches = list(_SRT_TIME_RE.finditer(raw))
+    segments: list[dict[str, Any]] = []
+    for index, match in enumerate(matches):
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
+        body = raw[match.end():body_end]
+        lines = [line.strip() for line in body.splitlines()]
+        lines = [line for line in lines if line and not line.isdigit() and line.upper() != "WEBVTT"]
+        text = _clean_subtitle_text(" ".join(lines))
+        cue = _valid_cue(_clock_to_seconds(match.group("start")), _clock_to_seconds(match.group("end")), text)
+        if cue:
+            segments.append(cue)
+    return segments
 
-    words: list[dict[str, Any]] = []
-    cues = _SRT_TIME_RE.split(raw)
-    # ``re.split`` with groups yields [preamble, start, end, body, start, end, body, ...]
-    for index in range(1, len(cues) - 2, 3):
-        start = _clock_to_seconds(cues[index])
-        end = _clock_to_seconds(cues[index + 1])
-        body = cues[index + 2].strip().splitlines()
-        text = " ".join(line for line in body if line.strip() and not line.strip().isdigit())
+
+def _parse_json3_segments(path: Path) -> list[dict[str, Any]]:
+    """Read YouTube json3 events as timed cues (never fabricate word timings)."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    events = [event for event in (payload.get("events") or []) if isinstance(event, dict)]
+    starts: list[float] = []
+    for event in events:
+        try:
+            starts.append(float(event.get("tStartMs") or 0) / 1000.0)
+        except (TypeError, ValueError):
+            starts.append(0.0)
+    output: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        segments = [seg for seg in (event.get("segs") or []) if isinstance(seg, dict)]
+        text = _clean_subtitle_text("".join(str(seg.get("utf8") or "") for seg in segments))
         if not text:
             continue
-        if end <= start:
-            end = start + max(0.6, 0.05 * len(text.split()))
-        words.extend(_words_from_cue(text, start, end))
-    return _repair_caption_timings(words)
+        start = starts[index]
+        try:
+            duration_ms = float(event.get("dDurationMs") or 0)
+        except (TypeError, ValueError):
+            duration_ms = 0.0
+        if duration_ms > 0:
+            end = start + duration_ms / 1000.0
+        elif index + 1 < len(starts) and starts[index + 1] > start:
+            end = starts[index + 1]
+        else:
+            end = start + 1.5
+        cue = _valid_cue(start, end, text)
+        if cue:
+            output.append(cue)
+    return output
 
 
-def parse_transcript_file(path: str | Path) -> list[dict[str, Any]]:
-    """Parse any supported transcript file (``.json3``, ``.srt``, ``.vtt``, ``.txt``)."""
+def _parse_plain_segments(path: Path) -> list[dict[str, Any]]:
+    """Parse timestamped text: ``[hh:mm:ss] text`` or ``start --> end text``."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return []
+    start_only = re.compile(r"^\s*\[?(?P<stamp>\d{1,}:\d{2}(?::\d{2})?(?:[,.]\d{1,3})?)\]?\s*[-–:]?\s*(?P<text>.+)$")
+    explicit = re.compile(rf"^\s*(?P<start>{_TIME_PATTERN})\s*-->\s*(?P<end>{_TIME_PATTERN})\s*(?P<text>.+)$")
+    parsed: list[dict[str, Any]] = []
+    for line in lines:
+        match = explicit.match(line)
+        if match:
+            cue = _valid_cue(_clock_to_seconds(match.group("start")), _clock_to_seconds(match.group("end")), match.group("text"))
+        else:
+            match = start_only.match(line)
+            if not match:
+                continue
+            cue = {"start": _clock_to_seconds(match.group("stamp")), "end": 0.0, "text": _clean_subtitle_text(match.group("text"))}
+        if cue and cue["text"]:
+            parsed.append(cue)
+    for index, cue in enumerate(parsed):
+        if cue["end"] <= cue["start"]:
+            next_start = parsed[index + 1]["start"] if index + 1 < len(parsed) else cue["start"] + 3.0
+            cue["end"] = max(cue["start"] + 0.08, next_start if next_start > cue["start"] else cue["start"] + 3.0)
+    return parsed
+
+
+def parse_transcript_segments(path: str | Path) -> list[dict[str, Any]]:
+    """Parse supported transcript files into cue-level text/timestamps.
+
+    SRT/VTT cues remain cues. No estimated per-word timestamps are created;
+    explicit word timing is reserved for ASR/forced-alignment results.
+    """
     target = Path(path)
     suffix = target.suffix.lower()
-    if suffix == ".json3":
-        return parse_json3_captions(target)
     if suffix in {".srt", ".vtt"}:
-        return parse_subtitle_captions(target)
+        return _parse_subtitle_segments(target)
+    if suffix == ".json3":
+        return _parse_json3_segments(target)
     if suffix == ".txt":
-        return _parse_plain_transcript(target)
+        return _parse_plain_segments(target)
     return []
 
 
-def _parse_plain_transcript(path: Path) -> list[dict[str, Any]]:
-    """Parse ``[hh:mm:ss] text`` or ``mm:ss text`` style plain transcripts."""
-    words: list[dict[str, Any]] = []
-    pattern = re.compile(r"^\s*\[?(?P<stamp>\d{1,2}:\d{2}(?::\d{2})?)\]?\s*[-–:]?\s*(?P<text>.+)$")
-    for line in (path.read_text(encoding="utf-8", errors="replace").splitlines() if path.exists() else []):
-        match = pattern.match(line)
-        if not match:
-            continue
-        start = _clock_to_seconds(match.group("stamp"))
-        words.extend(_words_from_cue(match.group("text"), start, start + 3.0))
-    return _repair_caption_timings(words)
+def parse_subtitle_captions(path: str | Path) -> list[dict[str, Any]]:
+    """Compatibility name for cue parsing; it does not invent word timings."""
+    return _parse_subtitle_segments(Path(path))
 
 
-def _repair_caption_timings(words: list[dict[str, Any]], *, min_gap: float = 0.02) -> list[dict[str, Any]]:
-    """Make a caption-derived word list strictly increasing (no overlaps)."""
-    for index in range(len(words) - 1):
-        current, following = words[index], words[index + 1]
-        limit = max(following["start"] - min_gap, current["start"] + 0.05)
-        if current["end"] > following["start"]:
-            current["end"] = round(limit, 3)
-        if current["end"] <= current["start"]:
-            current["end"] = round(current["start"] + 0.05, 3)
-    return words
+def parse_transcript_file(path: str | Path) -> list[dict[str, Any]]:
+    """Parse a supported transcript into normalized cue segments."""
+    return parse_transcript_segments(path)
 
 
 def transcript_files(folder: Path) -> list[Path]:
-    """Transcript/caption files a user dropped into a project folder (newest first)."""
-    found: list[Path] = []
+    """Transcript files in priority order: explicit user uploads before source tracks."""
     if not folder.exists():
-        return found
-    for path in folder.iterdir():
-        if path.is_file() and path.suffix.lower() in TRANSCRIPT_EXTENSIONS and path.stat().st_size > 32:
-            found.append(path)
-    priority = {".json3": 0, ".srt": 1, ".vtt": 2, ".txt": 3}
-    return sorted(found, key=lambda item: (priority.get(item.suffix.lower(), 9), -item.stat().st_mtime))
+        return []
+    found = [
+        path for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in TRANSCRIPT_EXTENSIONS and path.stat().st_size > 32
+    ]
+    priority = {".srt": 0, ".vtt": 1, ".json3": 2, ".txt": 3}
+    return sorted(
+        found,
+        key=lambda item: (
+            0 if item.stem.lower().startswith("provided") else 1,
+            priority.get(item.suffix.lower(), 9),
+            -item.stat().st_mtime,
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -841,6 +835,7 @@ __all__ = [
     "parse_json3_captions",
     "parse_subtitle_captions",
     "parse_transcript_file",
+    "parse_transcript_segments",
     "parse_youtube_url",
     "youtube_video_id",
     "safe_upload_path",
